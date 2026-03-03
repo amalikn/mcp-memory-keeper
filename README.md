@@ -711,6 +711,13 @@ mcp_context_save({
   channel: 'auth-feature', // Explicitly set channel
 });
 
+// If channel is omitted, channel can be inferred from key prefix
+// "mcp-stuff/sequential-thinking-promotion" -> channel "mcp-stuff"
+mcp_context_save({
+  key: 'mcp-stuff/sequential-thinking-promotion',
+  value: 'Promotion task started',
+});
+
 // Get items from a specific channel
 mcp_context_get({ channel: 'auth-feature' });
 
@@ -930,6 +937,14 @@ mcp_context_batch_save({
     { key: 'config_api_url', value: 'https://api.example.com', category: 'note' },
     { key: 'config_timeout', value: '30000', category: 'note' },
     { key: 'config_retries', value: '3', category: 'note' },
+  ],
+});
+
+// Batch save also infers channel from key prefix when item.channel is omitted
+mcp_context_batch_save({
+  items: [
+    { key: 'mcp-stuff/submodule-bump', value: 'done', category: 'progress' },
+    { key: 'podbng-lab/stage-2-next', value: 'pending', category: 'task' },
   ],
 });
 

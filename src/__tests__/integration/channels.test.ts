@@ -1,6 +1,10 @@
 import { DatabaseManager } from '../../utils/database';
 import { RepositoryManager } from '../../repositories/RepositoryManager';
-import { deriveChannelFromBranch, createSessionWithGitInfo } from '../../utils/channels';
+import {
+  deriveChannelFromBranch,
+  createSessionWithGitInfo,
+  inferChannelFromKey,
+} from '../../utils/channels';
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -104,6 +108,16 @@ describe('Channels Feature Integration Tests', () => {
       expect(deriveChannelFromBranch(null as any)).toBeNull();
       expect(deriveChannelFromBranch(undefined as any)).toBeNull();
     });
+
+    it('should infer channel from key prefix', () => {
+      expect(inferChannelFromKey('mcp-stuff/sequential-thinking')).toBe('mcp-stuff');
+      expect(inferChannelFromKey('codex-mcp/proxmox-add/done')).toBe('codex-mcp');
+    });
+
+    it('should not infer channel when key has no slash prefix', () => {
+      expect(inferChannelFromKey('repo_scan:modelcontextprotocol')).toBeNull();
+      expect(inferChannelFromKey('simple-key')).toBeNull();
+    });
   });
 
   describe('context_session_start with channels', () => {
@@ -204,6 +218,27 @@ describe('Channels Feature Integration Tests', () => {
       expect(contextItem.channel).toBe('channel-one');
     });
 
+    it('should infer channel from key prefix when channel is omitted', () => {
+      const contextItem = repositories.contexts.save(testSessionId, {
+        key: 'mcp-stuff/sequential-thinking-promotion-start',
+        value: 'test-value',
+      });
+
+      expect(contextItem).toBeDefined();
+      expect(contextItem.channel).toBe('mcp-stuff');
+    });
+
+    it('should prioritize explicit channel over key prefix inference', () => {
+      const contextItem = repositories.contexts.save(testSessionId, {
+        key: 'mcp-stuff/sequential-thinking-promotion-start',
+        value: 'test-value',
+        channel: 'override-channel',
+      });
+
+      expect(contextItem).toBeDefined();
+      expect(contextItem.channel).toBe('override-channel');
+    });
+
     it('should fallback to "general" when session has no channel', () => {
       // Create session without channel
       const sessionNoChannel = uuidv4();
@@ -231,6 +266,38 @@ describe('Channels Feature Integration Tests', () => {
         .get(testSessionId, 'test-key') as any;
 
       expect(item.channel).toBe('my-channel');
+    });
+  });
+
+  describe('context_batch_save with channels', () => {
+    beforeEach(() => {
+      db.prepare('INSERT INTO sessions (id, name, default_channel) VALUES (?, ?, ?)').run(
+        testSessionId,
+        'Batch Session',
+        'batch-default'
+      );
+    });
+
+    it('should infer channels from key prefixes for batch items', () => {
+      const result = repositories.contexts.batchSave(
+        testSessionId,
+        [
+          { key: 'mcp-stuff/task-1', value: 'v1' },
+          { key: 'podbng-lab/task-2', value: 'v2' },
+          { key: 'plain-key', value: 'v3' },
+        ],
+        { updateExisting: true }
+      );
+
+      expect(result.results.filter(r => r.success)).toHaveLength(3);
+
+      const mcpItem = repositories.contexts.getByKey(testSessionId, 'mcp-stuff/task-1');
+      const podItem = repositories.contexts.getByKey(testSessionId, 'podbng-lab/task-2');
+      const plainItem = repositories.contexts.getByKey(testSessionId, 'plain-key');
+
+      expect(mcpItem?.channel).toBe('mcp-stuff');
+      expect(podItem?.channel).toBe('podbng-lab');
+      expect(plainItem?.channel).toBe('batch-default');
     });
   });
 

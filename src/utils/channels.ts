@@ -107,6 +107,35 @@ export function normalizeChannel(channel: string): string {
 }
 
 /**
+ * Infers a channel from a context key prefix.
+ * Example: "mcp-stuff/some-key" -> "mcp-stuff"
+ *
+ * Returns null when key has no slash prefix or inference is not reliable.
+ */
+export function inferChannelFromKey(key: string): string | null {
+  if (!key || typeof key !== 'string') {
+    return null;
+  }
+
+  const slashIdx = key.indexOf('/');
+  if (slashIdx <= 0) {
+    return null;
+  }
+
+  const prefix = key.substring(0, slashIdx).trim();
+  if (!prefix) {
+    return null;
+  }
+
+  const normalized = normalizeChannel(prefix);
+  if (!normalized || normalized === 'general') {
+    return null;
+  }
+
+  return isValidChannel(normalized) ? normalized : null;
+}
+
+/**
  * Helper interface for session creation with git info
  */
 export interface SessionWithGitInfoOptions {

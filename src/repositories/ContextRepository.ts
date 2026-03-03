@@ -2,6 +2,7 @@ import { BaseRepository } from './BaseRepository.js';
 import { ContextItem, CreateContextItemInput } from '../types/entities.js';
 import { ensureSQLiteFormat } from '../utils/timestamps.js';
 import { validateKey } from '../utils/validation.js';
+import { inferChannelFromKey, normalizeChannel } from '../utils/channels.js';
 
 // Type for valid sort options (for documentation)
 type _SortOption =
@@ -95,6 +96,19 @@ export class ContextRepository extends BaseRepository {
     return modifiedSql;
   }
 
+  private resolveContextChannel(defaultChannel: string, key: string, explicitChannel?: string): string {
+    if (explicitChannel && explicitChannel.trim()) {
+      return normalizeChannel(explicitChannel);
+    }
+
+    const inferred = inferChannelFromKey(key);
+    if (inferred) {
+      return inferred;
+    }
+
+    return defaultChannel || 'general';
+  }
+
   private getTotalCount(baseSql: string, params: any[]): number {
     const countSql = baseSql.replace('SELECT *', 'SELECT COUNT(*) as count');
     const countStmt = this.db.prepare(countSql);
@@ -109,13 +123,11 @@ export class ContextRepository extends BaseRepository {
     const id = this.generateId();
     const size = this.calculateSize(input.value);
 
-    // Determine channel - use explicit channel, or session default, or 'general'
-    let channel = input.channel;
-    if (!channel) {
-      const sessionStmt = this.db.prepare('SELECT default_channel FROM sessions WHERE id = ?');
-      const session = sessionStmt.get(sessionId) as any;
-      channel = session?.default_channel || 'general';
-    }
+    // Determine channel - explicit channel > key prefix inference > session default > general
+    const sessionStmt = this.db.prepare('SELECT default_channel FROM sessions WHERE id = ?');
+    const session = sessionStmt.get(sessionId) as any;
+    const defaultChannel = session?.default_channel || 'general';
+    const channel = this.resolveContextChannel(defaultChannel, validatedKey, input.channel);
 
     const stmt = this.db.prepare(`
       INSERT OR REPLACE INTO context_items 
@@ -1866,7 +1878,7 @@ export class ContextRepository extends BaseRepository {
             item.value,
             item.category || null,
             item.priority || 'normal',
-            item.channel || defaultChannel,
+            this.resolveContextChannel(defaultChannel, validatedKey, item.channel),
             now,
             size,
             sessionId,
@@ -1892,7 +1904,7 @@ export class ContextRepository extends BaseRepository {
             item.value,
             item.category || null,
             item.priority || 'normal',
-            item.channel || defaultChannel,
+            this.resolveContextChannel(defaultChannel, validatedKey, item.channel),
             now,
             now,
             size,
