@@ -91,8 +91,8 @@ export class RetentionManager {
         name TEXT NOT NULL,
         enabled BOOLEAN DEFAULT true,
         policy_config TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),
+        updated_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),
         last_run TIMESTAMP
       );
       
@@ -100,7 +100,7 @@ export class RetentionManager {
         id TEXT PRIMARY KEY,
         policy_id TEXT NOT NULL,
         result TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),
         FOREIGN KEY (policy_id) REFERENCES retention_policies(id)
       );
       
@@ -164,7 +164,7 @@ export class RetentionManager {
       .prepare(
         `
       UPDATE retention_policies 
-      SET policy_config = ?, updated_at = CURRENT_TIMESTAMP
+      SET policy_config = ?, updated_at = datetime('now', 'localtime')
       WHERE id = ?
     `
       )
@@ -361,7 +361,7 @@ export class RetentionManager {
           .prepare(
             `
           UPDATE retention_policies 
-          SET last_run = CURRENT_TIMESTAMP 
+          SET last_run = datetime('now', 'localtime') 
           WHERE id = ?
         `
           )
@@ -495,7 +495,7 @@ export class RetentionManager {
         metadata TEXT,
         size INTEGER DEFAULT 0,
         created_at TIMESTAMP,
-        archived_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        archived_at TIMESTAMP DEFAULT (datetime('now', 'localtime'))
       );
     `);
 

@@ -308,7 +308,7 @@ export class WatcherRepository {
       .prepare(
         `
       DELETE FROM context_watchers 
-      WHERE expires_at < datetime('now') AND is_active = 1
+      WHERE expires_at < datetime('now', 'localtime') AND is_active = 1
     `
       )
       .run();

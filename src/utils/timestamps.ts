@@ -2,8 +2,59 @@
  * Timestamp utility functions for converting between ISO and SQLite formats
  *
  * SQLite stores timestamps in "YYYY-MM-DD HH:MM:SS" format
- * JavaScript Date objects use ISO format "YYYY-MM-DDTHH:MM:SS.sssZ"
+ * JavaScript Date objects use ISO format with local timezone offset
+ * "YYYY-MM-DDTHH:MM:SS.sss±HH:MM"
  */
+
+function pad(value: number, length: number = 2): string {
+  return String(value).padStart(length, '0');
+}
+
+function formatLocalOffset(date: Date): string {
+  const totalMinutes = -date.getTimezoneOffset();
+  const sign = totalMinutes >= 0 ? '+' : '-';
+  const absoluteMinutes = Math.abs(totalMinutes);
+  const hours = Math.floor(absoluteMinutes / 60);
+  const minutes = absoluteMinutes % 60;
+  return `${sign}${pad(hours)}:${pad(minutes)}`;
+}
+
+function toLocalISOStringFromDate(date: Date): string {
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(
+    date.getHours()
+  )}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}${formatLocalOffset(
+    date
+  )}`;
+}
+
+function toSQLiteLocalTimestampFromDate(date: Date): string {
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(
+    date.getHours()
+  )}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+function parseSQLiteLocalTimestamp(sqliteTimestamp: string): Date {
+  const match = sqliteTimestamp.match(/^(\d{4})-(\d{2})-(\d{2})\s(\d{2}):(\d{2}):(\d{2})$/);
+
+  if (!match) {
+    throw new Error(`Invalid SQLite timestamp format: ${sqliteTimestamp}`);
+  }
+
+  const [, year, month, day, hours, minutes, seconds] = match;
+  return new Date(
+    Number(year),
+    Number(month) - 1,
+    Number(day),
+    Number(hours),
+    Number(minutes),
+    Number(seconds),
+    0
+  );
+}
+
+export function localISOString(date: Date = new Date()): string {
+  return toLocalISOStringFromDate(date);
+}
 
 /**
  * Convert ISO timestamp to SQLite format
@@ -16,15 +67,18 @@ export function toSQLiteTimestamp(isoTimestamp: string): string {
   }
 
   // Handle already converted timestamps (SQLite format)
-  if (!isoTimestamp.includes('T') || !isoTimestamp.includes('Z')) {
+  if (isSQLiteTimestamp(isoTimestamp)) {
     // Already in SQLite format or not an ISO timestamp
     return isoTimestamp;
   }
 
   try {
-    // Convert ISO format to SQLite format
-    // "2025-06-27T02:07:07.253Z" -> "2025-06-27 02:07:07"
-    return isoTimestamp.replace('T', ' ').replace(/\.\d{3}Z$/, '');
+    const parsed = new Date(isoTimestamp);
+    if (Number.isNaN(parsed.getTime())) {
+      throw new Error('Invalid date value');
+    }
+
+    return toSQLiteLocalTimestampFromDate(parsed);
   } catch (_error) {
     throw new Error(`Invalid ISO timestamp format: ${isoTimestamp}`);
   }
@@ -41,15 +95,14 @@ export function toISOTimestamp(sqliteTimestamp: string): string {
   }
 
   // Handle already converted timestamps (ISO format)
-  if (sqliteTimestamp.includes('T') && sqliteTimestamp.includes('Z')) {
+  if (isISOTimestamp(sqliteTimestamp)) {
     // Already in ISO format
     return sqliteTimestamp;
   }
 
   try {
-    // Convert SQLite format to ISO format
-    // "2025-06-27 02:07:07" -> "2025-06-27T02:07:07.000Z"
-    return sqliteTimestamp.replace(' ', 'T') + '.000Z';
+    const parsed = parseSQLiteLocalTimestamp(sqliteTimestamp);
+    return toLocalISOStringFromDate(parsed);
   } catch (_error) {
     throw new Error(`Invalid SQLite timestamp format: ${sqliteTimestamp}`);
   }
@@ -63,8 +116,8 @@ export function toISOTimestamp(sqliteTimestamp: string): string {
 export function isISOTimestamp(timestamp: string): boolean {
   if (!timestamp) return false;
 
-  // ISO format contains 'T' and ends with 'Z'
-  return timestamp.includes('T') && timestamp.endsWith('Z');
+  // ISO format contains date/time separator and timezone designator
+  return /T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/.test(timestamp);
 }
 
 /**

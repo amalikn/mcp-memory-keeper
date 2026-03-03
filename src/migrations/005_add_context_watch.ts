@@ -77,7 +77,7 @@ export const up = (db: Database): void => {
         category TEXT,
         channel TEXT,
         sequence_number INTEGER NOT NULL,
-        deleted_at TEXT DEFAULT (datetime('now')),
+        deleted_at TEXT DEFAULT (datetime('now', 'localtime')),
         FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
       )
     `);

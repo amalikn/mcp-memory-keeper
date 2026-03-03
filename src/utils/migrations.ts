@@ -80,7 +80,7 @@ export class MigrationManager {
         dependencies TEXT, -- JSON array
         requires_backup BOOLEAN DEFAULT false,
         checksum TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),
         applied_at TIMESTAMP,
         rollback_at TIMESTAMP
       );
@@ -96,7 +96,7 @@ export class MigrationManager {
         execution_time INTEGER, -- milliseconds
         rows_affected INTEGER,
         backup_path TEXT,
-        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        timestamp TIMESTAMP DEFAULT (datetime('now', 'localtime')),
         FOREIGN KEY (migration_id) REFERENCES migrations(id)
       );
       
@@ -310,7 +310,7 @@ export class MigrationManager {
           db.prepare(
             `
             UPDATE migrations 
-            SET applied_at = CURRENT_TIMESTAMP 
+            SET applied_at = datetime('now', 'localtime') 
             WHERE id = ?
           `
           ).run(migration.id);
@@ -401,7 +401,7 @@ export class MigrationManager {
           db.prepare(
             `
             UPDATE migrations 
-            SET applied_at = NULL, rollback_at = CURRENT_TIMESTAMP 
+            SET applied_at = NULL, rollback_at = datetime('now', 'localtime') 
             WHERE id = ?
           `
           ).run(migration.id);
@@ -594,7 +594,7 @@ export class MigrationManager {
             compression_ratio REAL NOT NULL,
             date_range_start TIMESTAMP NOT NULL,
             date_range_end TIMESTAMP NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),
             FOREIGN KEY (session_id) REFERENCES sessions(id)
           );
           CREATE INDEX IF NOT EXISTS idx_compressed_session ON compressed_context(session_id);

@@ -21,7 +21,7 @@ export function up(db: Database): void {
         priority TEXT,
         channel TEXT,
         size_delta INTEGER DEFAULT 0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),
         created_by TEXT,
         FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
       );
@@ -37,7 +37,7 @@ export function up(db: Database): void {
         filter_channels TEXT,
         filter_priorities TEXT,
         last_sequence INTEGER DEFAULT 0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),
         last_poll_at TIMESTAMP,
         expires_at TIMESTAMP,
         metadata TEXT,
@@ -112,7 +112,7 @@ export function up(db: Database): void {
     db.prepare(
       `
       INSERT INTO migrations (id, version, name, description, up_sql, applied_at)
-      VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      VALUES (?, ?, ?, ?, ?, datetime('now', 'localtime'))
     `
     ).run(
       version,

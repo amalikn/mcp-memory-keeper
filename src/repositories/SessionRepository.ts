@@ -54,7 +54,7 @@ export class SessionRepository extends BaseRepository {
 
       const stmt = this.db.prepare(`
         UPDATE sessions 
-        SET ${setClause}, updated_at = CURRENT_TIMESTAMP 
+        SET ${setClause}, updated_at = datetime('now', 'localtime') 
         WHERE id = ?
       `);
 

@@ -11,6 +11,17 @@ export class DatabaseManager {
   private db: Database.Database;
   private config: Required<DatabaseConfig>;
 
+  private normalizeSqlDefaults(sql: string): string {
+    return sql.replace(
+      /DEFAULT\s+datetime\('now',\s*'localtime'\)/g,
+      "DEFAULT (datetime('now', 'localtime'))"
+    );
+  }
+
+  private execSql(sql: string): void {
+    this.db.exec(this.normalizeSqlDefaults(sql));
+  }
+
   constructor(config: DatabaseConfig) {
     this.config = {
       filename: config.filename,
@@ -55,7 +66,7 @@ export class DatabaseManager {
   }
 
   private createTables(): void {
-    this.db.exec(`
+    this.execSql(`
       -- Sessions table
       CREATE TABLE IF NOT EXISTS sessions (
         id TEXT PRIMARY KEY,
@@ -65,8 +76,8 @@ export class DatabaseManager {
         working_directory TEXT,
         parent_id TEXT,
         default_channel TEXT DEFAULT 'general',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT datetime('now', 'localtime'),
+        updated_at TIMESTAMP DEFAULT datetime('now', 'localtime'),
         FOREIGN KEY (parent_id) REFERENCES sessions(id)
       );
 
@@ -82,8 +93,8 @@ export class DatabaseManager {
         size INTEGER DEFAULT 0,
         is_private INTEGER DEFAULT 0,
         channel TEXT DEFAULT 'general',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT datetime('now', 'localtime'),
+        updated_at TIMESTAMP DEFAULT datetime('now', 'localtime'),
         FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
         UNIQUE(session_id, key)
       );
@@ -96,8 +107,8 @@ export class DatabaseManager {
         content TEXT,
         hash TEXT,
         size INTEGER DEFAULT 0,
-        last_read TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_read TIMESTAMP DEFAULT datetime('now', 'localtime'),
+        updated_at TIMESTAMP DEFAULT datetime('now', 'localtime'),
         FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
         UNIQUE(session_id, file_path)
       );
@@ -111,7 +122,7 @@ export class DatabaseManager {
         metadata TEXT,
         git_status TEXT,
         git_branch TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT datetime('now', 'localtime'),
         FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
       );
 
@@ -151,7 +162,7 @@ export class DatabaseManager {
         type TEXT NOT NULL,
         name TEXT NOT NULL,
         attributes TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT datetime('now', 'localtime'),
         FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
       );
 
@@ -162,7 +173,7 @@ export class DatabaseManager {
         predicate TEXT NOT NULL,
         object_id TEXT NOT NULL,
         confidence REAL DEFAULT 1.0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT datetime('now', 'localtime'),
         FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
         FOREIGN KEY (subject_id) REFERENCES entities(id) ON DELETE CASCADE,
         FOREIGN KEY (object_id) REFERENCES entities(id) ON DELETE CASCADE
@@ -173,7 +184,7 @@ export class DatabaseManager {
         entity_id TEXT NOT NULL,
         observation TEXT NOT NULL,
         source TEXT,
-        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        timestamp TIMESTAMP DEFAULT datetime('now', 'localtime'),
         FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE
       );
 
@@ -184,7 +195,7 @@ export class DatabaseManager {
         content_type TEXT NOT NULL, -- 'context_item' or 'file_cache'
         embedding BLOB NOT NULL,
         metadata TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT datetime('now', 'localtime'),
         UNIQUE(content_id, content_type)
       );
 
@@ -195,7 +206,7 @@ export class DatabaseManager {
         id TEXT PRIMARY KEY,
         type TEXT NOT NULL,
         input TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT datetime('now', 'localtime')
       );
 
       CREATE TABLE IF NOT EXISTS agent_results (
@@ -206,7 +217,7 @@ export class DatabaseManager {
         confidence REAL DEFAULT 0.0,
         reasoning TEXT,
         processing_time INTEGER,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT datetime('now', 'localtime'),
         FOREIGN KEY (task_id) REFERENCES agent_tasks(id) ON DELETE CASCADE
       );
 
@@ -219,7 +230,7 @@ export class DatabaseManager {
         entry TEXT NOT NULL,
         mood TEXT,
         tags TEXT, -- JSON array of tags
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT datetime('now', 'localtime'),
         FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
       );
 
@@ -234,7 +245,7 @@ export class DatabaseManager {
         to_key TEXT NOT NULL,
         relationship_type TEXT NOT NULL,
         metadata TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT datetime('now', 'localtime'),
         FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
         UNIQUE(session_id, from_key, to_key, relationship_type)
       );
@@ -252,7 +263,7 @@ export class DatabaseManager {
         size_before INTEGER NOT NULL,
         size_after INTEGER NOT NULL,
         summary TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT datetime('now', 'localtime'),
         FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
       );
 
@@ -264,8 +275,8 @@ export class DatabaseManager {
         enabled BOOLEAN DEFAULT 1,
         policy_config TEXT NOT NULL, -- JSON configuration
         last_run TIMESTAMP,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT datetime('now', 'localtime'),
+        updated_at TIMESTAMP DEFAULT datetime('now', 'localtime')
       );
 
       CREATE TABLE IF NOT EXISTS retention_executions (
@@ -276,7 +287,7 @@ export class DatabaseManager {
         items_affected INTEGER DEFAULT 0,
         size_freed INTEGER DEFAULT 0,
         execution_log TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT datetime('now', 'localtime'),
         FOREIGN KEY (policy_id) REFERENCES retention_policies(id) ON DELETE CASCADE,
         FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE SET NULL
       );
@@ -285,7 +296,7 @@ export class DatabaseManager {
         id TEXT PRIMARY KEY,
         policy_id TEXT NOT NULL,
         result TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT datetime('now', 'localtime'),
         FOREIGN KEY (policy_id) REFERENCES retention_policies(id) ON DELETE CASCADE
       );
 
@@ -306,8 +317,8 @@ export class DatabaseManager {
         created_by TEXT,
         last_modified_by TEXT,
         config TEXT, -- JSON configuration
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT datetime('now', 'localtime'),
+        updated_at TIMESTAMP DEFAULT datetime('now', 'localtime')
       );
 
       CREATE TABLE IF NOT EXISTS feature_flag_history (
@@ -316,7 +327,7 @@ export class DatabaseManager {
         user_id TEXT,
         action TEXT NOT NULL, -- 'created', 'updated', 'evaluated'
         details TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT datetime('now', 'localtime'),
         FOREIGN KEY (flag_id) REFERENCES feature_flags(id) ON DELETE CASCADE
       );
 
@@ -329,7 +340,7 @@ export class DatabaseManager {
         compression_ratio REAL NOT NULL,
         date_range_start TIMESTAMP NOT NULL,
         date_range_end TIMESTAMP NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT datetime('now', 'localtime'),
         FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
       );
 
@@ -349,7 +360,7 @@ export class DatabaseManager {
         applied_at TIMESTAMP,
         rolled_back_at TIMESTAMP,
         rollback_at TIMESTAMP,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT datetime('now', 'localtime')
       );
 
       CREATE TABLE IF NOT EXISTS migration_log (
@@ -365,8 +376,8 @@ export class DatabaseManager {
         rows_affected INTEGER,
         backup_path TEXT,
         duration_ms INTEGER,
-        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        timestamp TIMESTAMP DEFAULT datetime('now', 'localtime'),
+        created_at TIMESTAMP DEFAULT datetime('now', 'localtime'),
         FOREIGN KEY (migration_id) REFERENCES migrations(id) ON DELETE CASCADE
       );
 
@@ -402,29 +413,29 @@ export class DatabaseManager {
 
   private setupMaintenanceTriggers(): void {
     // Update timestamp trigger
-    this.db.exec(`
+    this.execSql(`
       CREATE TRIGGER IF NOT EXISTS update_context_items_timestamp 
       AFTER UPDATE ON context_items
       BEGIN
-        UPDATE context_items SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+        UPDATE context_items SET updated_at = datetime('now', 'localtime') WHERE id = NEW.id;
       END;
 
       CREATE TRIGGER IF NOT EXISTS update_sessions_timestamp 
       AFTER UPDATE ON sessions
       BEGIN
-        UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+        UPDATE sessions SET updated_at = datetime('now', 'localtime') WHERE id = NEW.id;
       END;
 
       CREATE TRIGGER IF NOT EXISTS update_retention_policies_timestamp 
       AFTER UPDATE ON retention_policies
       BEGIN
-        UPDATE retention_policies SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+        UPDATE retention_policies SET updated_at = datetime('now', 'localtime') WHERE id = NEW.id;
       END;
 
       CREATE TRIGGER IF NOT EXISTS update_feature_flags_timestamp 
       AFTER UPDATE ON feature_flags
       BEGIN
-        UPDATE feature_flags SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+        UPDATE feature_flags SET updated_at = datetime('now', 'localtime') WHERE id = NEW.id;
       END;
     `);
   }
@@ -552,7 +563,7 @@ export class DatabaseManager {
         // Apply migration 004 - context watch functionality
         this.db.transaction(() => {
           // Create change tracking table
-          this.db.exec(`
+          this.execSql(`
             CREATE TABLE IF NOT EXISTS context_changes (
               sequence_id INTEGER PRIMARY KEY AUTOINCREMENT,
               session_id TEXT NOT NULL,
@@ -567,14 +578,14 @@ export class DatabaseManager {
               priority TEXT,
               channel TEXT,
               size_delta INTEGER DEFAULT 0,
-              created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+              created_at TIMESTAMP DEFAULT datetime('now', 'localtime'),
               created_by TEXT,
               FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
             );
           `);
 
           // Create watchers registry table
-          this.db.exec(`
+          this.execSql(`
             CREATE TABLE IF NOT EXISTS context_watchers (
               id TEXT PRIMARY KEY,
               session_id TEXT,
@@ -583,7 +594,7 @@ export class DatabaseManager {
               filter_channels TEXT,
               filter_priorities TEXT,
               last_sequence INTEGER DEFAULT 0,
-              created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+              created_at TIMESTAMP DEFAULT datetime('now', 'localtime'),
               last_poll_at TIMESTAMP,
               expires_at TIMESTAMP,
               metadata TEXT,
@@ -592,7 +603,7 @@ export class DatabaseManager {
           `);
 
           // Create indexes for performance
-          this.db.exec(`
+          this.execSql(`
             CREATE INDEX IF NOT EXISTS idx_changes_sequence ON context_changes(sequence_id);
             CREATE INDEX IF NOT EXISTS idx_changes_session_seq ON context_changes(session_id, sequence_id);
             CREATE INDEX IF NOT EXISTS idx_changes_created ON context_changes(created_at);
@@ -601,7 +612,7 @@ export class DatabaseManager {
           `);
 
           // Create triggers for change tracking
-          this.db.exec(`
+          this.execSql(`
             -- Trigger for INSERT operations on context_items
             CREATE TRIGGER IF NOT EXISTS track_context_insert
             AFTER INSERT ON context_items
@@ -733,7 +744,7 @@ export class DatabaseManager {
               category TEXT,
               channel TEXT,
               sequence_number INTEGER NOT NULL,
-              deleted_at TEXT DEFAULT (datetime('now')),
+              deleted_at TEXT DEFAULT (datetime('now', 'localtime')),
               FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
             )
           `);
@@ -763,7 +774,7 @@ export class DatabaseManager {
               this.db
                 .prepare(
                   `INSERT INTO migrations (id, version, name, description, up_sql, applied_at) 
-                   VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`
+                   VALUES (?, ?, ?, ?, ?, datetime('now', 'localtime'))`
                 )
                 .run(
                   '004_add_context_watch',
@@ -783,7 +794,7 @@ export class DatabaseManager {
               this.db
                 .prepare(
                   `INSERT INTO migrations (id, version, name, description, up_sql, applied_at) 
-                   VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`
+                   VALUES (?, ?, ?, ?, ?, datetime('now', 'localtime'))`
                 )
                 .run(
                   '005_add_context_watch',

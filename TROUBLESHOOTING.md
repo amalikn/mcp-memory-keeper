@@ -258,10 +258,66 @@ cat tsconfig.json
 
    ```bash
    # Make backup first
+   ```
+
+### "SqliteError: near \"(\": syntax error" on startup
+
+**Symptoms:**
+
+- MCP server fails to start and times out in client
+- Logs show `SqliteError: near "(": syntax error` during schema initialization
+
+**Cause:**
+
+- SQLite `CREATE TABLE` defaults for expressions must use wrapped form
+- Invalid form: `DEFAULT datetime('now', 'localtime')`
+- Valid form: `DEFAULT (datetime('now', 'localtime'))`
+
+**Solutions:**
+
+1. **Update schema/migration SQL defaults:**
+
+   ```sql
+   -- ❌ Invalid
+   created_at TIMESTAMP DEFAULT datetime('now', 'localtime')
+
+   -- ✅ Valid
+   created_at TIMESTAMP DEFAULT (datetime('now', 'localtime'))
+   ```
+
+2. **Rebuild after source changes:**
+
+   ```bash
+   npm run build
+   ```
+
+3. **Test startup directly:**
+
+   ```bash
+   node /absolute/path/to/mcp-memory-keeper/dist/index.js
+   ```
+
+4. **If using migrations/scripts, apply the same pattern everywhere:**
+
+   - Migration `CREATE TABLE` statements
+   - Runtime-created helper/archive tables
+   - Any custom SQL bootstrapping scripts
+
+5. **If issues persist, validate active command and DB path:**
+
+   ```bash
+   claude mcp get memory-keeper
+   codex mcp get memory-keeper
+   ```
+
    cp context.db context.db.backup
 
    # Try to recover
+
    sqlite3 context.db "PRAGMA integrity_check;"
+
+   ```
+
    ```
 
 ### "Out of memory" errors

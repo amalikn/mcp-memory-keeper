@@ -10,6 +10,36 @@ A Model Context Protocol (MCP) server that provides persistent context managemen
 
 ## 🚀 Quick Start
 
+## Single Source of Truth Paths
+
+Use these canonical paths for local multi-client setups (Claude + Codex):
+
+- `mcp-memory-keeper` repo: `<MCP_BASE>/mcp-memory-keeper`
+- Shared memory data dir: `<MCP_DATA_BASE>/mcp-memory-keeper`
+- Server entrypoint: `<MCP_BASE>/mcp-memory-keeper/dist/index.js`
+
+Recommended launch pattern:
+
+```bash
+bash -lc 'mkdir -p <MCP_DATA_BASE>/mcp-memory-keeper && cd <MCP_DATA_BASE>/mcp-memory-keeper && exec node <MCP_BASE>/mcp-memory-keeper/dist/index.js'
+```
+
+Change Once Checklist:
+
+- Update Claude user-scope server command: `claude mcp add-json -s user memory-keeper ...`
+- Update Codex user config: `~/.codex/config.toml` under `[mcp_servers.memory-keeper]`
+- Verify with:
+  - `claude mcp get memory-keeper`
+  - `codex mcp get memory-keeper`
+- Confirm active DB path:
+  - `ps aux | rg "mcp-memory-keeper|dist/index.js" | rg -v rg`
+  - `lsof -p <PID> | rg "context\.db|mcp-memory-keeper"`
+
+My Local Example:
+
+- `<MCP_BASE>` = `/Volumes/Data/_ai/_mcp`
+- `<MCP_DATA_BASE>` = `/Volumes/Data/_ai/mcp-data`
+
 Get started in under 30 seconds:
 
 ```bash
@@ -20,7 +50,7 @@ claude mcp add memory-keeper npx mcp-memory-keeper
 # Try: Analyze the current repo and save your analysis in memory-keeper
 ```
 
-That's it! Memory Keeper is now available in all your Claude sessions. Your context is stored in `~/mcp-data/memory-keeper/` and persists across sessions.
+That's it! Memory Keeper is now available in all your Claude sessions. By default (with `npx`/launcher setup), your context is stored in `~/mcp-data/memory-keeper/` and persists across sessions.
 
 ## 🚀 Practical Memory Keeper Workflow Example
 
@@ -189,6 +219,9 @@ claude mcp add memory-keeper node /absolute/path/to/mcp-memory-keeper/dist/index
 - `MEMORY_KEEPER_INSTALL_DIR` - Installation directory (default: `~/.local/mcp-servers/memory-keeper/`)
 - `MEMORY_KEEPER_AUTO_UPDATE` - Set to `1` to enable auto-updates
 
+> Important: `DATA_DIR` is used by launcher-based startup (`npx mcp-memory-keeper` / `launcher.sh`).
+> If you run `node /path/to/dist/index.js` directly, SQLite is created in the process working directory as `context.db`.
+
 #### Token Limit Configuration
 
 - `MCP_MAX_TOKENS` - Maximum tokens allowed in responses (default: `25000`, range: `1000-100000`)
@@ -326,6 +359,144 @@ claude mcp list
 claude mcp get memory-keeper
 ```
 
+### Codex CLI
+
+Add Memory Keeper in Codex:
+
+```bash
+codex mcp add memory-keeper npx mcp-memory-keeper
+
+# Verify
+codex mcp list
+codex mcp get memory-keeper
+```
+
+If `npx` startup is slow in your environment, use a local built entrypoint:
+
+```toml
+[mcp_servers.memory-keeper]
+command = "node"
+args = ["/absolute/path/to/mcp-memory-keeper/dist/index.js"]
+```
+
+This goes in `~/.codex/config.toml`.
+
+### Shared DB for Claude + Codex (Recommended)
+
+To ensure both assistants read/write the same memory, configure both to run from the same directory.
+
+Example shared path:
+
+`<MCP_DATA_BASE>/mcp-memory-keeper`
+
+#### Claude Code user-scope setup
+
+```bash
+claude mcp remove -s user memory-keeper
+claude mcp add -s user memory-keeper -- \
+  bash -lc 'mkdir -p <MCP_DATA_BASE>/mcp-memory-keeper && cd <MCP_DATA_BASE>/mcp-memory-keeper && exec node <MCP_BASE>/mcp-memory-keeper/dist/index.js'
+```
+
+#### Codex setup (`~/.codex/config.toml`)
+
+```toml
+[mcp_servers.memory-keeper]
+command = "bash"
+args = ["-lc", "mkdir -p <MCP_DATA_BASE>/mcp-memory-keeper && cd <MCP_DATA_BASE>/mcp-memory-keeper && exec node <MCP_BASE>/mcp-memory-keeper/dist/index.js"]
+```
+
+#### Verify active DB path
+
+```bash
+# Claude
+claude mcp get memory-keeper
+
+# Process-level check (macOS/Linux)
+ps aux | rg "mcp-memory-keeper|dist/index.js" | rg -v rg
+lsof -p <PID> | rg "context\.db|memory-keeper"
+```
+
+#### Migrate Existing Databases to Shared Path (Safe)
+
+If Claude and Codex were previously using different DB locations, migrate them into one shared directory.
+
+```bash
+TARGET="<MCP_DATA_BASE>/mcp-memory-keeper"
+CLAUDE_OLD="$HOME/mcp-data/memory-keeper"
+CODEX_OLD="<MCP_BASE>/mcp-memory-keeper"
+
+mkdir -p "$TARGET"
+TS=$(date +%Y%m%d-%H%M%S)
+
+# 1) Backup target (if it already has data)
+for f in context.db context.db-wal context.db-shm; do
+  [ -f "$TARGET/$f" ] && cp -f "$TARGET/$f" "$TARGET/$f.bak-$TS"
+done
+
+# 2) Backup source DBs
+for SRC in "$CLAUDE_OLD" "$CODEX_OLD"; do
+  for f in context.db context.db-wal context.db-shm; do
+    [ -f "$SRC/$f" ] && cp -f "$SRC/$f" "$SRC/$f.bak-$TS"
+  done
+done
+
+# 3) Pick one canonical DB and copy it to target
+# Example: prefer Claude DB if it has latest data
+for f in context.db context.db-wal context.db-shm; do
+  [ -f "$CLAUDE_OLD/$f" ] && cp -f "$CLAUDE_OLD/$f" "$TARGET/$f"
+done
+
+ls -l "$TARGET"/context.db*
+```
+
+Optional verification (compare row counts):
+
+```bash
+python3 - <<'PY'
+import sqlite3
+paths={
+  'claude_old':'/Users/$USER/mcp-data/memory-keeper/context.db',
+  'codex_old':'<MCP_BASE>/mcp-memory-keeper/context.db',
+  'shared_new':'<MCP_DATA_BASE>/mcp-memory-keeper/context.db',
+}
+for name,p in paths.items():
+  p=p.replace('$USER', __import__('os').environ.get('USER',''))
+  try:
+    con=sqlite3.connect(p); cur=con.cursor()
+    items=cur.execute('select count(*) from context_items').fetchone()[0]
+    sessions=cur.execute('select count(*) from sessions').fetchone()[0]
+    print(f"{name}: items={items}, sessions={sessions}, path={p}")
+    con.close()
+  except Exception as e:
+    print(f"{name}: unavailable ({e})")
+PY
+```
+
+Rollback (restore from backup):
+
+```bash
+TARGET="<MCP_DATA_BASE>/mcp-memory-keeper"
+TS="<backup-timestamp>"   # Example: 20260303-175300
+
+cp -f "$TARGET/context.db.bak-$TS" "$TARGET/context.db"
+[ -f "$TARGET/context.db-wal.bak-$TS" ] && cp -f "$TARGET/context.db-wal.bak-$TS" "$TARGET/context.db-wal"
+[ -f "$TARGET/context.db-shm.bak-$TS" ] && cp -f "$TARGET/context.db-shm.bak-$TS" "$TARGET/context.db-shm"
+
+ls -l "$TARGET"/context.db*
+```
+
+After rollback, restart Claude/Codex sessions so both reconnect to the restored DB files.
+
+### Multi-Client Conventions (Avoid Logical Conflicts)
+
+When Claude and Codex write to the same DB, SQLite handles storage-level concurrency (WAL), but you should adopt conventions to avoid key-level conflicts:
+
+- Use separate default sessions/channels (e.g., `claude-main`, `codex-main`)
+- Use key prefixes for tool-local notes (e.g., `claude:*`, `codex:*`)
+- Keep shared decisions in a dedicated channel (e.g., `shared-conventions`)
+- Use `private: true` for temporary notes not meant for cross-tool visibility
+- Merge intentionally via `context_search_all`, `context_summarize`, or session merge workflows
+
 ### Claude Desktop App
 
 1. Open Claude Desktop settings
@@ -377,6 +548,38 @@ claude mcp add memory-keeper npx mcp-memory-keeper
 # The server output will appear in Claude Code's output panel
 ```
 
+### Timestamp Timezone Behavior (Local PC)
+
+Memory Keeper now uses the local machine timezone for timestamps.
+
+- SQLite defaults/triggers use local time (`datetime('now', 'localtime')`)
+- In `CREATE TABLE` statements, SQLite default expressions must be wrapped as `DEFAULT (datetime('now', 'localtime'))`
+- ISO timestamps generated by the server use local offset format (for example `2026-03-03T20:56:57.739+11:00`)
+
+If you maintain custom SQL migrations/scripts, prefer the wrapped `DEFAULT (...)` form to avoid startup errors like `SqliteError: near "(": syntax error` on schema initialization.
+
+If you are upgrading from older UTC-based data and want to migrate existing records:
+
+```bash
+# Default DB path: ./context.db
+npm run migrate:timestamps:local
+
+# Preview only (no writes)
+node scripts/migrate-timestamps-local.mjs --dry-run
+
+# Or specify explicit DB path
+node scripts/migrate-timestamps-local.mjs /absolute/path/to/context.db
+
+# Preview explicit DB path (no writes)
+node scripts/migrate-timestamps-local.mjs /absolute/path/to/context.db --dry-run
+```
+
+The migration script creates a backup next to the DB before updates (`*.bak-localtime-*`).
+
+If you move to a different timezone, existing rows keep previously stored local values,
+and new rows use the new local timezone. This is expected. If you want all rows
+normalized to the new local timezone representation, run the migration script again.
+
 ### Updating to Latest Version
 
 With the npx installation method, you automatically get the latest version every time! No manual updates needed.
@@ -394,6 +597,51 @@ npm update -g mcp-memory-keeper
 **Note**: You don't need to reconfigure the MCP server in Claude after updating. Just start a new session!
 
 ## Usage
+
+### Complete Tool Catalog (All 38 Tools)
+
+This server currently exposes 38 tools in the `full` profile.
+
+- `mcp_context_session_start(...)` - Start or continue a context session.
+- `mcp_context_session_list(...)` - List recent sessions.
+- `mcp_context_set_project_dir(...)` - Set git-tracked project directory for current session.
+- `mcp_context_save(...)` - Save a single context item.
+- `mcp_context_get(...)` - Retrieve context items with filters.
+- `mcp_context_cache_file(...)` - Cache file content hash for change tracking.
+- `mcp_context_file_changed(...)` - Check if file changed since cached.
+- `mcp_context_status()` - Show current session/status summary.
+- `mcp_context_checkpoint(...)` - Create a named checkpoint.
+- `mcp_context_restore_checkpoint(...)` - Restore from checkpoint.
+- `mcp_context_diff(...)` - Get changes since time/checkpoint.
+- `mcp_context_timeline(...)` - View activity timeline by time period.
+- `mcp_context_prepare_compaction()` - Auto-save critical context before compaction.
+- `mcp_context_git_commit(...)` - Create git commit with optional auto-save.
+- `mcp_context_search(...)` - Search context in current session.
+- `mcp_context_search_all(...)` - Search across all sessions.
+- `mcp_context_export(...)` - Export session context.
+- `mcp_context_import(...)` - Import context backup.
+- `mcp_context_analyze(...)` - Extract entities/relationships from context.
+- `mcp_context_find_related(...)` - Find entities related to a key/entity.
+- `mcp_context_visualize(...)` - Generate graph/timeline/heatmap visualization data.
+- `mcp_context_semantic_search(...)` - Natural-language semantic search.
+- `mcp_context_delegate(...)` - Delegate analysis/synthesis tasks to agents.
+- `mcp_context_branch_session(...)` - Branch session for alternative exploration.
+- `mcp_context_merge_sessions(...)` - Merge another session into current session.
+- `mcp_context_journal_entry(...)` - Add timestamped journal entries.
+- `mcp_context_compress(...)` - Intelligently compress older context.
+- `mcp_context_integrate_tool(...)` - Track external MCP/tool events.
+- `mcp_context_batch_save(...)` - Save many items atomically.
+- `mcp_context_batch_update(...)` - Update many items atomically.
+- `mcp_context_batch_delete(...)` - Delete many items atomically.
+- `mcp_context_reassign_channel(...)` - Move items between channels.
+- `mcp_context_link(...)` - Create relationship between two items.
+- `mcp_context_get_related(...)` - Retrieve related items from graph links.
+- `mcp_context_watch(...)` - Watch context changes in near real time.
+- `mcp_context_list_channels(...)` - List channels and metadata.
+- `mcp_context_channel_stats(...)` - Get per-channel activity/statistics.
+- `mcp_context_summarize(...)` - Generate AI-friendly session summary.
+
+For full parameters and response schema for each tool, see `API.md`.
 
 ### Session Management
 
@@ -588,7 +836,7 @@ mcp_context_save({
 mcp_context_status(); // Check what's saved
 
 // 7. After Claude Code restart
-mcp_context_get({ category: 'task', priority: 'high' }); // Get high priority tasks
+mcp_context_get({ category: 'task', priorities: ['high'] }); // Get high priority tasks
 mcp_context_get({ key: 'architecture_decision' }); // Get specific decisions
 mcp_context_file_changed({ filePath: 'lib/settings/context.ex' }); // Check for changes
 ```
@@ -807,6 +1055,31 @@ mcp_context_search({
   query: 'bug',
   sessionId: 'session-id',
 });
+
+// Search across all sessions
+mcp_context_search_all({
+  query: 'authentication',
+  limit: 20,
+  includeShared: true,
+});
+
+// Get changes since a known checkpoint/time
+mcp_context_diff({
+  since: '2 hours ago',
+  includeValues: true,
+  limit: 50,
+});
+
+// List channels with metadata
+mcp_context_list_channels({
+  sort: 'activity_desc',
+});
+
+// Get statistics for a specific channel
+mcp_context_channel_stats({
+  channel: 'auth-feature',
+  includeInsights: true,
+});
 ```
 
 ### Export/Import (Phase 3)
@@ -940,7 +1213,7 @@ mcp_context_delegate({
   taskType: 'synthesize',
   input: {
     synthesisType: 'recommendations',
-    analysisResults: {}, // Can pass previous analysis results
+    insights: ['high-priority task count increased'],
   },
 });
 
@@ -1016,7 +1289,7 @@ mcp_context_timeline({
   groupBy: 'hour',
   includeItems: true, // Show actual items, not just counts
   categories: ['task', 'progress'], // Filter by categories
-  relativeTime: true, // Show "2 hours ago" format
+  relativeTime: 'today', // Natural-language time filter (e.g., "today", "2 hours ago")
   itemsPerPeriod: 10, // Limit items shown per time period
 });
 
@@ -1035,7 +1308,7 @@ Save space by intelligently compressing old context:
 // Compress items older than 30 days
 mcp_context_compress({
   olderThan: '2024-01-01',
-  preserveCategories: ['decision', 'critical'], // Keep these
+  preserveCategories: ['decision', 'warning'], // Keep these
   targetSize: 1000, // Target size in KB (optional)
 });
 
@@ -1162,7 +1435,7 @@ Test categories:
 | Semantic Search  | ✅ Stable | v0.6+   | Natural language queries   |
 | Multi-Agent      | ✅ Stable | v0.7+   | Intelligent processing     |
 
-### Current Features (v0.10.0)
+### Current Features (v0.12.0)
 
 - ✅ **Session Management**: Create, list, and continue sessions with branching support
 - ✅ **Channels**: Persistent topic-based organization (auto-derived from git branch)

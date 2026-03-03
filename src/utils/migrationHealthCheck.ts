@@ -147,8 +147,8 @@ export class MigrationHealthCheck {
       ['branch', 'TEXT'],
       ['working_directory', 'TEXT'],
       ['parent_id', 'TEXT'],
-      ['created_at', 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP'],
-      ['updated_at', 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP'],
+      ['created_at', "TIMESTAMP DEFAULT datetime('now', 'localtime')"],
+      ['updated_at', "TIMESTAMP DEFAULT datetime('now', 'localtime')"],
     ]);
 
     const contextItemsColumns = new Map<string, string>([
@@ -162,8 +162,8 @@ export class MigrationHealthCheck {
       ['size', 'INTEGER DEFAULT 0'],
       ['shared', 'BOOLEAN DEFAULT 0'],
       ['shared_with_sessions', 'TEXT'],
-      ['created_at', 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP'],
-      ['updated_at', 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP'],
+      ['created_at', "TIMESTAMP DEFAULT datetime('now', 'localtime')"],
+      ['updated_at', "TIMESTAMP DEFAULT datetime('now', 'localtime')"],
     ]);
 
     const fileCacheColumns = new Map<string, string>([
@@ -173,8 +173,8 @@ export class MigrationHealthCheck {
       ['content', 'TEXT'],
       ['hash', 'TEXT'],
       ['size', 'INTEGER DEFAULT 0'],
-      ['last_read', 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP'],
-      ['updated_at', 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP'],
+      ['last_read', "TIMESTAMP DEFAULT datetime('now', 'localtime')"],
+      ['updated_at', "TIMESTAMP DEFAULT datetime('now', 'localtime')"],
     ]);
 
     schemaMap.set('sessions', sessionsColumns);
@@ -192,14 +192,14 @@ export class MigrationHealthCheck {
     columnName: string,
     columnDef: string
   ): string {
-    // SQLite doesn't support CURRENT_TIMESTAMP as default in ALTER TABLE
+    // SQLite doesn't support datetime('now', 'localtime') as default in ALTER TABLE
     // Replace with a static timestamp
     let safeColumnDef = columnDef;
 
-    if (columnDef.includes('CURRENT_TIMESTAMP')) {
+    if (columnDef.includes("datetime('now', 'localtime')")) {
       const currentTimestamp = new Date().toISOString();
       safeColumnDef = columnDef.replace(
-        /DEFAULT CURRENT_TIMESTAMP/g,
+        /DEFAULT datetime('now', 'localtime')/g,
         `DEFAULT '${currentTimestamp}'`
       );
     }

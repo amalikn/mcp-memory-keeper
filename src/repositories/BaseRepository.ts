@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import { DatabaseManager } from '../utils/database.js';
+import { ensureSQLiteFormat, localISOString } from '../utils/timestamps.js';
 
 export abstract class BaseRepository {
   protected db: Database.Database;
@@ -28,6 +29,6 @@ export abstract class BaseRepository {
   }
 
   protected getCurrentTimestamp(): string {
-    return new Date().toISOString();
+    return ensureSQLiteFormat(localISOString());
   }
 }

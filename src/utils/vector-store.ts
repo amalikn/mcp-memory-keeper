@@ -34,7 +34,7 @@ export class VectorStore {
         content TEXT NOT NULL,
         embedding BLOB NOT NULL,
         metadata TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),
         FOREIGN KEY (content_id) REFERENCES context_items(id) ON DELETE CASCADE
       );
 

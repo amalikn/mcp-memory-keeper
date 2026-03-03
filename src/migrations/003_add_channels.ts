@@ -22,8 +22,8 @@ export const addChannelsMigration: Omit<Migration, 'id' | 'createdAt'> = {
       size INTEGER DEFAULT 0,
       is_private INTEGER DEFAULT 0,
       channel TEXT NOT NULL DEFAULT 'general',
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      created_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),
+      updated_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),
       FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
       UNIQUE(session_id, key)
     );
@@ -55,7 +55,7 @@ export const addChannelsMigration: Omit<Migration, 'id' | 'createdAt'> = {
     CREATE TRIGGER update_context_items_timestamp 
     AFTER UPDATE ON context_items
     BEGIN
-      UPDATE context_items SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+      UPDATE context_items SET updated_at = datetime('now', 'localtime') WHERE id = NEW.id;
     END;
     
     -- Add default_channel column to sessions table
@@ -68,8 +68,8 @@ export const addChannelsMigration: Omit<Migration, 'id' | 'createdAt'> = {
       working_directory TEXT,
       parent_id TEXT,
       default_channel TEXT NOT NULL DEFAULT 'general',
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      created_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),
+      updated_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),
       FOREIGN KEY (parent_id) REFERENCES sessions(id)
     );
     
@@ -90,7 +90,7 @@ export const addChannelsMigration: Omit<Migration, 'id' | 'createdAt'> = {
     CREATE TRIGGER update_sessions_timestamp 
     AFTER UPDATE ON sessions
     BEGIN
-      UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+      UPDATE sessions SET updated_at = datetime('now', 'localtime') WHERE id = NEW.id;
     END;
   `,
 
@@ -106,8 +106,8 @@ export const addChannelsMigration: Omit<Migration, 'id' | 'createdAt'> = {
       metadata TEXT,
       size INTEGER DEFAULT 0,
       is_private INTEGER DEFAULT 0,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      created_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),
+      updated_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),
       FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
       UNIQUE(session_id, key)
     );
@@ -137,7 +137,7 @@ export const addChannelsMigration: Omit<Migration, 'id' | 'createdAt'> = {
     CREATE TRIGGER update_context_items_timestamp 
     AFTER UPDATE ON context_items
     BEGIN
-      UPDATE context_items SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+      UPDATE context_items SET updated_at = datetime('now', 'localtime') WHERE id = NEW.id;
     END;
     
     -- Revert sessions to previous schema
@@ -148,8 +148,8 @@ export const addChannelsMigration: Omit<Migration, 'id' | 'createdAt'> = {
       branch TEXT,
       working_directory TEXT,
       parent_id TEXT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      created_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),
+      updated_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),
       FOREIGN KEY (parent_id) REFERENCES sessions(id)
     );
     
@@ -170,7 +170,7 @@ export const addChannelsMigration: Omit<Migration, 'id' | 'createdAt'> = {
     CREATE TRIGGER update_sessions_timestamp 
     AFTER UPDATE ON sessions
     BEGIN
-      UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+      UPDATE sessions SET updated_at = datetime('now', 'localtime') WHERE id = NEW.id;
     END;
   `,
 };

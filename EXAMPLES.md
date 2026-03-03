@@ -10,6 +10,7 @@
 - [Channel Reorganization Examples](#channel-reorganization-examples) (NEW)
 - [Context Relationships Examples](#context-relationships-examples) (NEW)
 - [Real-time Monitoring Examples](#real-time-monitoring-examples) (NEW)
+- [Operational Visibility Examples](#operational-visibility-examples) (NEW)
 - [Advanced Usage](#advanced-usage)
 - [Tips & Best Practices](#tips--best-practices)
 
@@ -828,7 +829,7 @@ setInterval(async () => {
   const changes = await context_watch({
     action: 'poll',
     watcherId: watcher.watcherId,
-    timeout: 0, // Immediate return
+    pollTimeout: 0, // Immediate return
   });
 
   if (changes.items.length > 0) {
@@ -877,6 +878,56 @@ updates.items.forEach(item => {
 Object.entries(byChannel).forEach(([channel, items]) => {
   console.log(`${channel}: ${items.length} updates`);
 });
+```
+
+## Operational Visibility Examples
+
+### Set Project Directory Explicitly
+
+Use this when your session started without `projectDir` but you want git-aware behavior:
+
+```javascript
+await context_set_project_dir({
+  projectDir: '/path/to/your/project',
+});
+```
+
+### Track Changes Since Last Milestone
+
+Use `context_diff` to inspect what changed since a checkpoint or time reference:
+
+```javascript
+// Since a named checkpoint
+await context_diff({
+  since: 'before-bulk-import-feature',
+  includeValues: true,
+});
+
+// Since a relative time window
+await context_diff({
+  since: '2 hours ago',
+  limit: 100,
+});
+```
+
+### Channel Discovery and Statistics
+
+Get a fast overview of active channels and deep stats for one channel:
+
+```javascript
+// List channels with metadata
+const channels = await context_list_channels({
+  sort: 'activity_desc',
+});
+
+// Inspect one channel in detail
+const authStats = await context_channel_stats({
+  channel: 'feature-auth',
+  includeInsights: true,
+});
+
+console.log(channels.channels?.length || channels.length);
+console.log(authStats);
 ```
 
 ### Enhanced Timeline with Details
@@ -939,13 +990,18 @@ Find information from any previous session:
 // Search for all authentication-related work
 const results = await context_search({
   query: 'authentication',
-  includeAllSessions: true,
+  // Current session search
+});
+
+// Search across all sessions
+const globalResults = await context_search_all({
+  query: 'authentication',
 });
 
 // Search in specific categories
 const decisions = await context_search({
   query: 'database',
-  categories: ['decision'],
+  category: 'decision',
 });
 ```
 
@@ -956,8 +1012,8 @@ Automatically save context on commits:
 ```typescript
 // Configure git integration
 await context_git_commit({
+  message: 'chore: save context-linked checkpoint',
   autoSave: true,
-  includeMessage: true,
 });
 
 // Now every git commit will:
@@ -972,23 +1028,20 @@ Regular backups of your context:
 
 ```typescript
 // Export current session
-await context_export({
+const backup = await context_export({
   format: 'json',
   sessionId: currentSessionId,
-  outputPath: './backups/session-2024-01-15.json',
 });
 
-// Export everything
+// Optional: export as inline payload for programmatic transport
 await context_export({
-  format: 'json',
-  includeAllSessions: true,
-  outputPath: './backups/full-backup.json',
+  format: 'inline',
 });
 
 // Later, import on new machine
 await context_import({
-  filePath: './backups/full-backup.json',
-  mergeStrategy: 'skip_existing',
+  filePath: backup.filePath,
+  merge: true,
 });
 ```
 
@@ -1082,16 +1135,12 @@ await context_session_start({
 
 ```typescript
 // List old sessions
-const oldSessions = await context_session_list({
-  limit: 20,
-  beforeDate: '2024-01-01',
-});
+const oldSessions = await context_session_list({ limit: 20 });
 
-// Export for archive
-await context_export({
-  sessionIds: oldSessions.map(s => s.id),
-  outputPath: './archive/old-sessions.json',
-});
+// Export each old session for archive
+for (const s of oldSessions.sessions || oldSessions) {
+  await context_export({ sessionId: s.id, format: 'json' });
+}
 
 // Then clean up database
 // (Manual cleanup commands coming in future version)
@@ -1282,7 +1331,6 @@ await mcp_context_delegate({
   taskType: 'synthesize',
   input: {
     synthesisType: 'summary',
-    categories: ['task', 'decision'],
     maxLength: 500,
   },
 });
@@ -1292,10 +1340,7 @@ await mcp_context_delegate({
   taskType: 'synthesize',
   input: {
     synthesisType: 'recommendations',
-    analysisResults: {
-      highPriorityCount: 15,
-      contextSize: 2000,
-    },
+    insights: ['high priority tasks increased', 'recent blocker mentions up'],
   },
 });
 // Returns immediate actions, short-term goals, and warnings
@@ -1412,7 +1457,7 @@ await mcp_context_compress({
 // Compress everything except recent work
 await mcp_context_compress({
   olderThan: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString(), // 7 days
-  preserveCategories: ['decision', 'critical'],
+  preserveCategories: ['decision', 'warning'],
 });
 ```
 

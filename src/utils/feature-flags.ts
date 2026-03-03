@@ -83,8 +83,8 @@ export class FeatureFlagManager {
         enabled_until TIMESTAMP,
         category TEXT,
         tags TEXT, -- JSON array
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),
+        updated_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),
         created_by TEXT,
         last_modified_by TEXT
       );
@@ -96,7 +96,7 @@ export class FeatureFlagManager {
         enabled BOOLEAN NOT NULL,
         reason TEXT NOT NULL,
         context TEXT, -- JSON
-        evaluated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        evaluated_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),
         FOREIGN KEY (flag_id) REFERENCES feature_flags(id)
       );
       
@@ -108,7 +108,7 @@ export class FeatureFlagManager {
         old_value TEXT, -- JSON
         new_value TEXT, -- JSON
         user_id TEXT,
-        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        timestamp TIMESTAMP DEFAULT (datetime('now', 'localtime'))
       );
       
       CREATE INDEX IF NOT EXISTS idx_feature_flags_key ON feature_flags(key);

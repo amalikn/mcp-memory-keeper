@@ -9,6 +9,7 @@
 - [Context Relationships](#context-relationships)
 - [File Management](#file-management)
 - [Checkpoints](#checkpoints)
+- [Git & Compaction](#git--compaction)
 - [Real-time Monitoring](#real-time-monitoring)
 - [Search & Analysis](#search--analysis)
 - [Export/Import](#exportimport)
@@ -73,8 +74,6 @@ List recent sessions with optional filtering.
 ```typescript
 {
   limit?: number;          // Number of sessions to return (default: 10)
-  beforeDate?: string;     // Filter sessions before this date
-  afterDate?: string;      // Filter sessions after this date
 }
 ```
 
@@ -95,6 +94,36 @@ List recent sessions with optional filtering.
 }
 ```
 
+### context_set_project_dir
+
+Set or update the project directory for git tracking in the current session.
+
+**Parameters:**
+
+```typescript
+{
+  projectDir: string; // Absolute path to a git repository root or project folder
+}
+```
+
+**Returns:**
+
+```typescript
+{
+  success: boolean;
+  message: string;
+  projectDir: string;
+}
+```
+
+**Example:**
+
+```typescript
+await context_set_project_dir({
+  projectDir: '/path/to/your/project',
+});
+```
+
 ## Context Storage
 
 ### context_save
@@ -108,8 +137,7 @@ Save context information with categories and priorities.
   key: string;             // Unique identifier for the context item
   value: string;           // Content to save
   category?: 'task' | 'decision' | 'progress' | 'note' | 'warning' | 'error';
-  priority?: 'critical' | 'high' | 'normal' | 'low';
-  metadata?: any;          // Additional JSON metadata
+  priority?: 'high' | 'normal' | 'low';
   private?: boolean;       // If true, item is only visible in current session (default: false - shared across all sessions)
   channel?: string;        // Channel to save to (default: session's defaultChannel or auto-derived from git branch)
 }
@@ -135,7 +163,6 @@ await context_save({
   value: 'Using JWT with 24h expiry and refresh tokens',
   category: 'decision',
   priority: 'high',
-  metadata: { reviewedBy: 'team', approvedDate: '2024-01-15' },
 });
 
 // Save private context (only visible in current session)
@@ -232,7 +259,7 @@ await context_get({
 
 // Get recent high-priority items with metadata
 await context_get({
-  priorities: ['high', 'critical'],
+  priorities: ['high'],
   createdAfter: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
   includeMetadata: true,
   sort: 'created_desc',
@@ -243,7 +270,7 @@ await context_get({
   category: 'task',
   limit: 20,
   offset: 40, // Skip first 40 items
-  sort: 'priority',
+  sort: 'updated_desc',
 });
 
 // Pattern matching
@@ -253,9 +280,42 @@ await context_get({
 });
 ```
 
+### context_status
+
+Get current context status and summary statistics for the active session.
+
+**Parameters:**
+
+```typescript
+{
+}
+```
+
+**Returns:**
+
+```typescript
+{
+  sessionId: string;
+  sessionName?: string;
+  itemCount: number;
+  categories: Record<string, number>;
+  priorities: Record<string, number>;
+  channels?: Record<string, number>;
+  lastUpdated?: string;
+}
+```
+
+**Example:**
+
+```typescript
+await context_status();
+```
+
 ### context_delete
 
-Delete a specific context item.
+Legacy tool retained for compatibility in some deployments.
+
+> Recommended replacement: `context_batch_delete` (supports both single-key and bulk deletes).
 
 **Parameters:**
 
@@ -355,13 +415,10 @@ Get detailed statistics and insights for a specific channel.
 
 ```typescript
 {
-  channel: string;         // Channel name (required)
-  sessionId?: string;      // Filter by specific session (default: all sessions)
-  includeInsights?: boolean; // Generate AI-friendly insights (default: true)
-  timeRange?: {           // Optional time range for analysis
-    start?: string;       // ISO timestamp
-    end?: string;         // ISO timestamp
-  };
+  channel?: string;         // Channel name (omit for all-channels overview)
+  sessionId?: string;       // Session context for privacy filtering
+  includeTimeSeries?: boolean; // Include hourly/daily activity data (default: false)
+  includeInsights?: boolean;   // Include AI-generated insights (default: false)
 }
 ```
 
@@ -425,12 +482,10 @@ await context_channel_stats({
   channel: 'feature-auth',
 });
 
-// Focus on recent activity
+// Include time-series activity data
 await context_channel_stats({
   channel: 'debugging',
-  timeRange: {
-    start: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString(), // Last 7 days
-  },
+  includeTimeSeries: true,
 });
 
 // Get stats without AI insights (faster)
@@ -970,9 +1025,8 @@ Cache file content for change detection.
 
 ```typescript
 {
-  filePath: string;        // Absolute or relative file path
-  content: string;         // File content
-  metadata?: any;          // Additional metadata
+  filePath: string; // Absolute or relative file path
+  content: string; // File content
 }
 ```
 
@@ -1098,6 +1152,69 @@ Enhanced user-friendly message explaining:
 🆘 Need your previous work? Use context_search_all to find items across sessions
 ```
 
+## Git & Compaction
+
+### context_prepare_compaction
+
+Automatically save critical context before model/window compaction.
+
+**Parameters:**
+
+```typescript
+{
+}
+```
+
+**Returns:**
+
+```typescript
+{
+  checkpointName: string;
+  savedItems: number;
+  summary?: string;
+  instructions?: string;
+}
+```
+
+**Example:**
+
+```typescript
+await context_prepare_compaction();
+```
+
+### context_git_commit
+
+Create a git commit with optional automatic context save/checkpoint.
+
+**Parameters:**
+
+```typescript
+{
+  message: string;         // Git commit message
+  autoSave?: boolean;      // Save context/checkpoint before commit (default: true)
+}
+```
+
+**Returns:**
+
+```typescript
+{
+  success: boolean;
+  commitHash?: string;
+  checkpointName?: string;
+  message: string;
+}
+```
+
+**Example:**
+
+```typescript
+await context_git_commit({
+  message: 'feat: add user authentication',
+  autoSave: true,
+});
+```
+
 ## Real-time Monitoring
 
 ### context_watch
@@ -1119,11 +1236,9 @@ Create a new watcher with filters for real-time monitoring.
     keys?: string[];         // Specific keys to watch (supports wildcards: "user_*", "*_config")
     categories?: ('task' | 'decision' | 'progress' | 'note' | 'warning' | 'error')[];
     channels?: string[];     // Specific channels to monitor
-    priorities?: ('critical' | 'high' | 'normal' | 'low')[];
-    sessionIds?: string[];   // Specific sessions (default: current session only)
+    priorities?: ('high' | 'normal' | 'low')[];
   };
-  includeExisting?: boolean; // Include existing items in first poll (default: false)
-  expiresIn?: number;        // Expiration time in seconds (default: 3600)
+  pollTimeout?: number;      // Optional polling timeout in seconds
 }
 ```
 
@@ -1137,7 +1252,6 @@ Create a new watcher with filters for real-time monitoring.
     categories?: string[];
     channels?: string[];
     priorities?: string[];
-    sessionIds?: string[];
   };
   createdAt: string;         // ISO timestamp
   expiresAt: string;         // ISO timestamp when watcher expires
@@ -1155,7 +1269,7 @@ Poll for changes since last check. Returns only new or updated items.
 {
   action: 'poll';
   watcherId: string;         // Watcher ID from create action
-  timeout?: number;          // Long-polling timeout in seconds (default: 0 - immediate return)
+  pollTimeout?: number;      // Long-polling timeout in seconds (default: 30)
 }
 ```
 
@@ -1233,7 +1347,6 @@ List all active watchers for the current session.
       categories?: string[];
       channels?: string[];
       priorities?: string[];
-      sessionIds?: string[];
     };
     createdAt: string;
     expiresAt: string;
@@ -1256,7 +1369,7 @@ const watcher = await context_watch({
   action: 'create',
   filters: {
     categories: ['task'],
-    priorities: ['high', 'critical'],
+    priorities: ['high'],
   },
 });
 
@@ -1280,7 +1393,6 @@ const watcher = await context_watch({
   filters: {
     keys: ['user_*', '*_config', 'auth_*'],
   },
-  includeExisting: true, // Get current state first
 });
 ```
 
@@ -1294,7 +1406,6 @@ const watcher = await context_watch({
     channels: ['feature-auth', 'feature-payments'],
     categories: ['error', 'warning'],
   },
-  expiresIn: 7200, // 2-hour expiration
 });
 ```
 
@@ -1305,18 +1416,18 @@ const watcher = await context_watch({
 const changes = await context_watch({
   action: 'poll',
   watcherId: watcher.watcherId,
-  timeout: 30, // Wait up to 30 seconds
+  pollTimeout: 30, // Wait up to 30 seconds
 });
 ```
 
-**Multi-session Monitoring:**
+**Channel/Category Monitoring:**
 
 ```typescript
-// Watch across multiple sessions
+// Watch decision updates in specific channels
 const watcher = await context_watch({
   action: 'create',
   filters: {
-    sessionIds: ['session-1', 'session-2', 'current'],
+    channels: ['feature-auth', 'feature-payments'],
     categories: ['decision'],
   },
 });
@@ -1338,7 +1449,7 @@ while (running) {
     const changes = await context_watch({
       action: 'poll',
       watcherId: watcher.watcherId,
-      timeout: 30, // Long poll
+      pollTimeout: 30, // Long poll
     });
 
     for (const item of changes.items) {
@@ -1674,72 +1785,26 @@ Analyze context to extract entities and relationships.
 
 ### context_export
 
-Export context data to a JSON file with enhanced validation and statistics.
+Export session context for backup or sharing.
 
 **Parameters:**
 
 ```typescript
 {
-  sessionId?: string;      // Session to export (default: current)
-  sessionIds?: string[];   // Multiple sessions to export
-  format?: 'json' | 'csv'; // Export format (default: json)
-  outputPath?: string;     // Custom output path
-  includeMetadata?: boolean; // Include system metadata
-  confirmEmpty?: boolean;  // Bypass empty export warning (default: false) [NEW v0.11.0]
-  includeStats?: boolean;  // Include detailed statistics (default: false) [NEW v0.11.0]
+  sessionId?: string;          // Session to export (default: current)
+  format?: 'json' | 'inline';  // Export format (default: 'json')
 }
 ```
 
-**Returns (Standard):**
+**Returns:**
 
 ```typescript
 {
-  filePath: string; // Output file path
-  stats: {
-    sessions: number;
-    items: number;
-    files: number;
-    checkpoints: number;
-    size: number; // File size in bytes
-  }
+  success: boolean;
+  filePath?: string; // Present when format = 'json'
+  content?: string;  // Present when format = 'inline'
 }
 ```
-
-**Returns (With includeStats=true):**
-
-```typescript
-{
-  filePath: string; // Output file path
-  stats: {
-    sessions: number;
-    items: number;
-    files: number;
-    checkpoints: number;
-    size: number; // File size in bytes
-  }
-  detailedStats: {
-    // Additional statistics [NEW v0.11.0]
-    byCategory: Record<string, number>; // Item count by category
-    byPriority: Record<string, number>; // Item count by priority
-    byChannel: Record<string, number>; // Item count by channel
-    dateRange: {
-      earliest: string; // ISO timestamp of earliest item
-      latest: string; // ISO timestamp of latest item
-    }
-    averageItemSize: number; // Average item size in bytes
-    totalValueSize: number; // Total size of all item values
-  }
-}
-```
-
-**Error Scenarios:**
-
-- `EMPTY_EXPORT`: Attempted to export with no data (unless confirmEmpty=true)
-- `NO_SESSION`: No active session and no sessionId provided
-- `SESSION_NOT_FOUND`: Specified session does not exist
-- `INVALID_FORMAT`: Unsupported export format
-- `FILE_WRITE_ERROR`: Failed to write export file
-- `DATABASE_ERROR`: Database read error during export
 
 **Examples:**
 
@@ -1747,48 +1812,17 @@ Export context data to a JSON file with enhanced validation and statistics.
 // Basic export of current session
 await context_export();
 
-// Export with detailed statistics
+// Export a specific session to file
 await context_export({
-  includeStats: true,
+  sessionId: 'session-id',
+  format: 'json',
 });
 
-// Export multiple sessions
+// Export as inline JSON payload
 await context_export({
-  sessionIds: ['session-1', 'session-2'],
-  outputPath: './exports/multi-session-backup.json',
-  includeStats: true,
+  format: 'inline',
 });
-
-// Force export even if empty
-await context_export({
-  confirmEmpty: true, // No warning for empty exports
-});
-
-// Handle empty export scenario
-try {
-  await context_export();
-} catch (error) {
-  if (error.code === 'EMPTY_EXPORT') {
-    console.log('No data to export. Use confirmEmpty:true to bypass.');
-    // Either add some data or confirm empty export
-    await context_export({ confirmEmpty: true });
-  }
-}
 ```
-
-**Best Practices:**
-
-1. **Regular Backups**: Export important sessions regularly
-2. **Include Statistics**: Use `includeStats:true` for export verification
-3. **Check Empty Exports**: Handle EMPTY_EXPORT errors appropriately
-4. **Archive Old Sessions**: Export and compress old sessions to save space
-5. **Version Control**: Consider adding exports to version control for team sharing
-
-**Backward Compatibility:**
-
-- The `confirmEmpty` and `includeStats` parameters are optional
-- Existing code will continue to work without changes
-- Empty exports will show a warning but can be bypassed with `confirmEmpty:true`
 
 ### context_import
 
@@ -1799,9 +1833,7 @@ Import context from file.
 ```typescript
 {
   filePath: string;        // Path to import file
-  merge?: boolean;         // Merge with existing (default: false)
-  mergeStrategy?: 'skip' | 'overwrite' | 'rename';
-  sessionName?: string;    // Override session name
+  merge?: boolean;         // Merge with current session (default: false)
 }
 ```
 
@@ -1809,15 +1841,10 @@ Import context from file.
 
 ```typescript
 {
-  imported: {
-    sessions: number;
-    items: number;
-    files: number;
-    checkpoints: number;
-  };
-  skipped: number;
-  errors: string[];
-  sessionIds: string[];    // Imported session IDs
+  success: boolean;
+  sessionId?: string;
+  importedItems?: number;
+  message: string;
 }
 ```
 
@@ -1834,7 +1861,6 @@ Find entities related to a key.
   key: string;             // Entity key to search from
   maxDepth?: number;       // Relationship depth (default: 2)
   relationTypes?: string[]; // Filter by relation types
-  limit?: number;          // Maximum results
 }
 ```
 
@@ -2308,9 +2334,9 @@ try {
 
 1. **Session Management**: Start a new session for each major task or feature
 2. **Categories**: Use consistent categories for better organization
-3. **Priorities**: Reserve 'critical' for truly important items
+3. **Priorities**: Reserve 'high' for truly important items
 4. **Keys**: Use descriptive, searchable keys
-5. **Metadata**: Store structured data in metadata field
+5. **Channels**: Use channels to keep feature contexts organized
 6. **Checkpoints**: Create checkpoints before major changes
 7. **Compression**: Regularly compress old data to maintain performance
 8. **Search**: Use semantic search for natural language queries
@@ -2340,7 +2366,7 @@ Common queries optimized for performance:
 // Today's decisions
 {
   category: "decision",
-  afterDate: new Date().toISOString().split('T')[0]
+  createdAfter: new Date().toISOString().split('T')[0]
 }
 
 // Recent errors with context
@@ -2358,14 +2384,14 @@ Common queries optimized for performance:
 await context_semantic_search({
   query: 'authentication refactor',
   minSimilarity: 0.7,
-  categories: ['task', 'decision'],
+  sessionId: 'session-id',
 });
 
 // Track feature progress
 await context_search({
   query: 'feature:user-management status:*',
   searchIn: ['value'],
-  categories: ['progress'],
+  category: 'progress',
 });
 ```
 
@@ -2375,15 +2401,15 @@ await context_search({
 // Blockers and impediments
 {
   query: "blocked OR waiting OR impediment",
-  categories: ["task", "warning"],
-  priority: "high"
+  category: "task",
+  priorities: ["high"]
 }
 
 // Recent decisions by area
 {
   category: "decision",
   query: "area:frontend OR area:backend",
-  groupBy: "metadata.area"
+  searchIn: ["value"]
 }
 ```
 
@@ -2393,16 +2419,15 @@ await context_search({
 // Slow operations
 {
   query: "duration:>1000ms",
-  categories: ["progress"],
-  sortBy: "metadata.duration",
-  order: "desc"
+  category: "progress",
+  sort: "created_desc"
 }
 
 // Memory usage patterns
 {
   query: "memory usage",
-  categories: ["progress", "warning"],
-  timeRange: "-7d"
+  category: "progress",
+  createdAfter: "7 days ago"
 }
 ```
 

@@ -1111,7 +1111,7 @@ To enable git tracking, use context_set_project_dir with your project path.`;
 
       const itemStmt = db.prepare(`
         INSERT INTO context_items (id, session_id, key, value, category, priority, size, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))
       `);
 
       for (const item of contextItems) {
@@ -1332,7 +1332,7 @@ To enable git tracking, use context_set_project_dir with your project path.`;
       db.prepare(
         `
         INSERT OR REPLACE INTO context_items (id, session_id, key, value, category, priority, size, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))
       `
       ).run(
         uuidv4(),
@@ -1394,7 +1394,7 @@ mcp_context_restore_checkpoint({ name: "${checkpointName}" })`,
         db.prepare(
           `
           INSERT OR REPLACE INTO context_items (id, session_id, key, value, category, priority, size, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+          VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))
         `
         ).run(
           uuidv4(),
@@ -1725,7 +1725,7 @@ Files: ${stats.files}`,
         // Import context items
         const itemStmt = db.prepare(`
           INSERT OR REPLACE INTO context_items (id, session_id, key, value, category, priority, size, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))
         `);
 
         let itemCount = 0;

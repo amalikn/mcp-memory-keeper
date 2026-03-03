@@ -31,8 +31,8 @@ export const simplifySharingMigration: Omit<Migration, 'id' | 'createdAt'> = {
       metadata TEXT,
       size INTEGER DEFAULT 0,
       is_private INTEGER DEFAULT 0,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      created_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),
+      updated_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),
       FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
       UNIQUE(session_id, key)
     );
@@ -62,7 +62,7 @@ export const simplifySharingMigration: Omit<Migration, 'id' | 'createdAt'> = {
     CREATE TRIGGER update_context_items_timestamp 
     AFTER UPDATE ON context_items
     BEGIN
-      UPDATE context_items SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+      UPDATE context_items SET updated_at = datetime('now', 'localtime') WHERE id = NEW.id;
     END;
   `,
 
@@ -79,8 +79,8 @@ export const simplifySharingMigration: Omit<Migration, 'id' | 'createdAt'> = {
       size INTEGER DEFAULT 0,
       shared INTEGER DEFAULT 0,
       shared_with_sessions TEXT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      created_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),
+      updated_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),
       FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
       UNIQUE(session_id, key)
     );
@@ -113,7 +113,7 @@ export const simplifySharingMigration: Omit<Migration, 'id' | 'createdAt'> = {
     CREATE TRIGGER update_context_items_timestamp 
     AFTER UPDATE ON context_items
     BEGIN
-      UPDATE context_items SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+      UPDATE context_items SET updated_at = datetime('now', 'localtime') WHERE id = NEW.id;
     END;
   `,
 };

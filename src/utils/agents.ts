@@ -116,7 +116,7 @@ export class AnalyzerAgent extends Agent {
     }
 
     if (timeframe) {
-      query += ` AND created_at >= datetime('now', ?)`;
+      query += ` AND created_at >= datetime('now', 'localtime', ?)`;
       params.push(timeframe);
     }
 
@@ -220,7 +220,7 @@ export class AnalyzerAgent extends Agent {
         priority
       FROM context_items
       WHERE session_id = ?
-        AND created_at >= datetime('now', ?)
+        AND created_at >= datetime('now', 'localtime', ?)
       GROUP BY date(created_at), category, priority
       ORDER BY date
     `;

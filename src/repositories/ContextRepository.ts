@@ -383,7 +383,7 @@ export class ContextRepository extends BaseRepository {
   copyBetweenSessions(fromSessionId: string, toSessionId: string): number {
     const stmt = this.db.prepare(`
       INSERT OR IGNORE INTO context_items (id, session_id, key, value, category, priority, metadata, size, is_private, channel, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))
     `);
 
     const items = this.getBySessionId(fromSessionId);
@@ -1758,7 +1758,7 @@ export class ContextRepository extends BaseRepository {
       // Perform the update
       const updateSql = `
         UPDATE context_items 
-        SET channel = ?, updated_at = CURRENT_TIMESTAMP
+        SET channel = ?, updated_at = datetime('now', 'localtime')
         WHERE id IN (${itemsToMove.map(() => '?').join(',')})
       `;
       const updateParams = [toChannel, ...itemsToMove.map(item => item.id)];
