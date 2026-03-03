@@ -150,6 +150,7 @@ Claude Code users often face context loss when the conversation window fills up.
 - 📺 **Channels** - Persistent topic-based organization (auto-derived from git branch)
 - 📸 Checkpoint system for complete context snapshots
 - 🤖 Smart compaction helper that never loses critical info
+- ♻️ Auto-capture recovery for interrupted mutating operations
 - 🔍 Full-text search across all saved context
 - 🕐 **Enhanced filtering** - Time-based queries, regex patterns, pagination
 - 📊 **Change tracking** - See what's been added, modified, or deleted since any point
@@ -161,6 +162,15 @@ Claude Code users often face context loss when the conversation window fills up.
 - 🔄 **Channel reassignment** - Move items between channels based on patterns
 - 🔗 **Context relationships** - Link related items with typed relationships
 - 👁️ **Real-time monitoring** - Watch for context changes with filters
+
+### Crash Recovery + Compaction Prep Behavior
+
+- Before any mutating tool runs, Memory Keeper writes an auto-capture record under `.memory-keeper-recovery/pending`.
+- If the operation completes, the pending capture is flushed to `.memory-keeper-recovery/resolved`.
+- If the process disconnects/crashes mid-operation, pending capture remains for recovery on reconnect.
+- `mcp_context_prepare_compaction()` creates a checkpoint before compaction-style cleanup.
+- `mcp_context_recovery_status()` lists unresolved pending captures.
+- `mcp_context_recovery_resolve({ pendingId, action, confirm: true })` confirms `commit` or `discard`.
 
 ## Installation
 
@@ -598,9 +608,9 @@ npm update -g mcp-memory-keeper
 
 ## Usage
 
-### Complete Tool Catalog (All 38 Tools)
+### Complete Tool Catalog (All 40 Tools)
 
-This server currently exposes 38 tools in the `full` profile.
+This server currently exposes 40 tools in the `full` profile.
 
 - `mcp_context_session_start(...)` - Start or continue a context session.
 - `mcp_context_session_list(...)` - List recent sessions.
@@ -610,6 +620,8 @@ This server currently exposes 38 tools in the `full` profile.
 - `mcp_context_cache_file(...)` - Cache file content hash for change tracking.
 - `mcp_context_file_changed(...)` - Check if file changed since cached.
 - `mcp_context_status()` - Show current session/status summary.
+- `mcp_context_recovery_status()` - List pending recovery captures from interrupted operations.
+- `mcp_context_recovery_resolve(...)` - Resolve a pending capture as commit/discard.
 - `mcp_context_checkpoint(...)` - Create a named checkpoint.
 - `mcp_context_restore_checkpoint(...)` - Restore from checkpoint.
 - `mcp_context_diff(...)` - Get changes since time/checkpoint.

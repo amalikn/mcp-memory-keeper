@@ -89,6 +89,127 @@ for (const warning of activeProfile.warnings) {
 // Track current session
 let currentSessionId: string | null = null;
 
+const MUTATING_TOOLS = new Set<string>([
+  'context_session_start',
+  'context_set_project_dir',
+  'context_save',
+  'context_cache_file',
+  'context_checkpoint',
+  'context_restore_checkpoint',
+  'context_prepare_compaction',
+  'context_git_commit',
+  'context_import',
+  'context_branch_session',
+  'context_merge_sessions',
+  'context_journal_entry',
+  'context_compress',
+  'context_integrate_tool',
+  'context_reassign_channel',
+  'context_batch_save',
+  'context_batch_delete',
+  'context_batch_update',
+  'context_link',
+]);
+
+const RECOVERY_BASE_DIR = path.join(process.cwd(), '.memory-keeper-recovery');
+const RECOVERY_PENDING_DIR = path.join(RECOVERY_BASE_DIR, 'pending');
+const RECOVERY_RESOLVED_DIR = path.join(RECOVERY_BASE_DIR, 'resolved');
+
+function ensureRecoveryDirs(): void {
+  fs.mkdirSync(RECOVERY_PENDING_DIR, { recursive: true });
+  fs.mkdirSync(RECOVERY_RESOLVED_DIR, { recursive: true });
+}
+
+function beginRecoveryCapture(toolName: string, args: unknown): string {
+  ensureRecoveryDirs();
+  const captureId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const payload = {
+    id: captureId,
+    status: 'pending',
+    tool: toolName,
+    args,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    note: 'Auto-captured before mutating operation.',
+  };
+  fs.writeFileSync(
+    path.join(RECOVERY_PENDING_DIR, `${captureId}.json`),
+    JSON.stringify(payload, null, 2),
+    'utf-8'
+  );
+  return captureId;
+}
+
+function markRecoveryCaptureFlushed(captureId: string): void {
+  ensureRecoveryDirs();
+  const pendingFile = path.join(RECOVERY_PENDING_DIR, `${captureId}.json`);
+  if (!fs.existsSync(pendingFile)) {
+    return;
+  }
+  const payload = JSON.parse(fs.readFileSync(pendingFile, 'utf-8'));
+  payload.status = 'flushed';
+  payload.updatedAt = new Date().toISOString();
+  fs.writeFileSync(
+    path.join(RECOVERY_RESOLVED_DIR, `${captureId}.flushed.json`),
+    JSON.stringify(payload, null, 2),
+    'utf-8'
+  );
+  fs.unlinkSync(pendingFile);
+}
+
+function markRecoveryCapturePendingError(captureId: string, error: unknown): void {
+  ensureRecoveryDirs();
+  const pendingFile = path.join(RECOVERY_PENDING_DIR, `${captureId}.json`);
+  if (!fs.existsSync(pendingFile)) {
+    return;
+  }
+  const payload = JSON.parse(fs.readFileSync(pendingFile, 'utf-8'));
+  payload.status = 'pending_recovery';
+  payload.updatedAt = new Date().toISOString();
+  payload.error = error instanceof Error ? error.message : String(error);
+  payload.note = 'Previous mutating operation may have been interrupted.';
+  fs.writeFileSync(pendingFile, JSON.stringify(payload, null, 2), 'utf-8');
+}
+
+function listPendingRecoveryRecords(): any[] {
+  ensureRecoveryDirs();
+  const files = fs
+    .readdirSync(RECOVERY_PENDING_DIR)
+    .filter(name => name.endsWith('.json'))
+    .sort();
+  const records: any[] = [];
+  for (const file of files) {
+    try {
+      records.push(JSON.parse(fs.readFileSync(path.join(RECOVERY_PENDING_DIR, file), 'utf-8')));
+    } catch (_error) {
+      // Ignore malformed files
+    }
+  }
+  return records;
+}
+
+function resolveRecoveryRecord(
+  pendingId: string,
+  action: 'commit' | 'discard'
+): { ok: boolean; message: string } {
+  ensureRecoveryDirs();
+  const pendingFile = path.join(RECOVERY_PENDING_DIR, `${pendingId}.json`);
+  if (!fs.existsSync(pendingFile)) {
+    return { ok: false, message: `Pending recovery item not found: ${pendingId}` };
+  }
+  const payload = JSON.parse(fs.readFileSync(pendingFile, 'utf-8'));
+  payload.status = action === 'commit' ? 'committed' : 'discarded';
+  payload.resolvedAt = new Date().toISOString();
+  payload.resolutionAction = action;
+  fs.writeFileSync(
+    path.join(RECOVERY_RESOLVED_DIR, `${pendingId}.${action}.json`),
+    JSON.stringify(payload, null, 2),
+    'utf-8'
+  );
+  fs.unlinkSync(pendingFile);
+  return { ok: true, message: `Recovery item ${pendingId} marked as ${payload.status}.` };
+}
+
 // Debug logging utility
 function debugLog(message: string, ...args: any[]): void {
   try {
@@ -364,265 +485,207 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
     };
   }
 
-  switch (toolName) {
-    // Session Management
-    case 'context_session_start': {
-      const { name, description, continueFrom, projectDir, defaultChannel } = args;
+  const executeTool = async () => {
+    switch (toolName) {
+      // Session Management
+      case 'context_session_start': {
+        const { name, description, continueFrom, projectDir, defaultChannel } = args;
 
-      // Project directory will be saved with the session if provided
+        // Project directory will be saved with the session if provided
 
-      // Get current git branch if available
-      let branch = null;
-      let gitDetected = false;
-      try {
-        const checkPath = projectDir || process.cwd();
+        // Get current git branch if available
+        let branch = null;
+        let gitDetected = false;
+        try {
+          const checkPath = projectDir || process.cwd();
 
-        // Try to detect if directory has git
-        const gitHeadPath = path.join(checkPath, '.git', 'HEAD');
-        if (fs.existsSync(gitHeadPath)) {
-          // Use simple-git to get proper branch info
-          const tempGit = simpleGit(checkPath);
-          const branchInfo = await tempGit.branch();
-          branch = branchInfo.current;
-          gitDetected = true;
+          // Try to detect if directory has git
+          const gitHeadPath = path.join(checkPath, '.git', 'HEAD');
+          if (fs.existsSync(gitHeadPath)) {
+            // Use simple-git to get proper branch info
+            const tempGit = simpleGit(checkPath);
+            const branchInfo = await tempGit.branch();
+            branch = branchInfo.current;
+            gitDetected = true;
+          }
+        } catch (_e) {
+          // Ignore git errors
         }
-      } catch (_e) {
-        // Ignore git errors
-      }
 
-      // Derive default channel if not provided
-      let channel = defaultChannel;
-      if (!channel) {
-        channel = deriveDefaultChannel(branch || undefined, name || undefined);
-      }
-
-      // Create new session using repository
-      const session = repositories.sessions.create({
-        name: name || `Session ${new Date().toISOString()}`,
-        description: description || '',
-        branch: branch || undefined,
-        working_directory: projectDir || undefined,
-        defaultChannel: channel,
-      });
-
-      // Copy context from previous session if specified
-      if (continueFrom) {
-        repositories.contexts.copyBetweenSessions(continueFrom, session.id);
-      }
-
-      currentSessionId = session.id;
-
-      let statusMessage = `Started new session: ${session.id}\nName: ${name || 'Unnamed'}\nChannel: ${channel}`;
-
-      if (projectDir) {
-        statusMessage += `\nProject directory: ${projectDir}`;
-        if (gitDetected) {
-          statusMessage += `\nGit branch: ${branch || 'unknown'}`;
-        } else {
-          statusMessage += `\nGit: No repository found in project directory`;
+        // Derive default channel if not provided
+        let channel = defaultChannel;
+        if (!channel) {
+          channel = deriveDefaultChannel(branch || undefined, name || undefined);
         }
-      } else {
-        statusMessage += `\nGit branch: ${branch || 'unknown'}`;
 
-        // Provide helpful guidance about setting project directory
-        const cwdHasGit = fs.existsSync(path.join(process.cwd(), '.git'));
-        if (cwdHasGit) {
-          statusMessage += `\n\n💡 Tip: Your current directory has a git repository. To enable full git tracking, start a session with:\ncontext_session_start({ name: "${name || 'My Session'}", projectDir: "${process.cwd()}" })`;
-        } else {
-          // Check for git repos in immediate subdirectories
-          const subdirs = fs
-            .readdirSync(process.cwd(), { withFileTypes: true })
-            .filter(dirent => dirent.isDirectory())
-            .map(dirent => dirent.name)
-            .filter(name => !name.startsWith('.'));
+        // Create new session using repository
+        const session = repositories.sessions.create({
+          name: name || `Session ${new Date().toISOString()}`,
+          description: description || '',
+          branch: branch || undefined,
+          working_directory: projectDir || undefined,
+          defaultChannel: channel,
+        });
 
-          const gitSubdirs = subdirs.filter(dir => {
-            try {
-              return fs.existsSync(path.join(process.cwd(), dir, '.git'));
-            } catch {
-              return false;
-            }
-          });
+        // Copy context from previous session if specified
+        if (continueFrom) {
+          repositories.contexts.copyBetweenSessions(continueFrom, session.id);
+        }
 
-          if (gitSubdirs.length > 0) {
-            statusMessage += `\n\n💡 Found git repositories in: ${gitSubdirs.join(', ')}`;
-            statusMessage += `\nTo enable git tracking, start a session with your project directory:`;
-            statusMessage += `\ncontext_session_start({ name: "${name || 'My Session'}", projectDir: "${path.join(process.cwd(), gitSubdirs[0])}" })`;
+        currentSessionId = session.id;
+
+        let statusMessage = `Started new session: ${session.id}\nName: ${name || 'Unnamed'}\nChannel: ${channel}`;
+
+        if (projectDir) {
+          statusMessage += `\nProject directory: ${projectDir}`;
+          if (gitDetected) {
+            statusMessage += `\nGit branch: ${branch || 'unknown'}`;
           } else {
-            statusMessage += `\n\n💡 To enable git tracking, start a session with your project directory:`;
-            statusMessage += `\ncontext_session_start({ name: "${name || 'My Session'}", projectDir: "/path/to/your/project" })`;
+            statusMessage += `\nGit: No repository found in project directory`;
+          }
+        } else {
+          statusMessage += `\nGit branch: ${branch || 'unknown'}`;
+
+          // Provide helpful guidance about setting project directory
+          const cwdHasGit = fs.existsSync(path.join(process.cwd(), '.git'));
+          if (cwdHasGit) {
+            statusMessage += `\n\n💡 Tip: Your current directory has a git repository. To enable full git tracking, start a session with:\ncontext_session_start({ name: "${name || 'My Session'}", projectDir: "${process.cwd()}" })`;
+          } else {
+            // Check for git repos in immediate subdirectories
+            const subdirs = fs
+              .readdirSync(process.cwd(), { withFileTypes: true })
+              .filter(dirent => dirent.isDirectory())
+              .map(dirent => dirent.name)
+              .filter(name => !name.startsWith('.'));
+
+            const gitSubdirs = subdirs.filter(dir => {
+              try {
+                return fs.existsSync(path.join(process.cwd(), dir, '.git'));
+              } catch {
+                return false;
+              }
+            });
+
+            if (gitSubdirs.length > 0) {
+              statusMessage += `\n\n💡 Found git repositories in: ${gitSubdirs.join(', ')}`;
+              statusMessage += `\nTo enable git tracking, start a session with your project directory:`;
+              statusMessage += `\ncontext_session_start({ name: "${name || 'My Session'}", projectDir: "${path.join(process.cwd(), gitSubdirs[0])}" })`;
+            } else {
+              statusMessage += `\n\n💡 To enable git tracking, start a session with your project directory:`;
+              statusMessage += `\ncontext_session_start({ name: "${name || 'My Session'}", projectDir: "/path/to/your/project" })`;
+            }
           }
         }
-      }
 
-      return {
-        content: [
-          {
-            type: 'text',
-            text: statusMessage,
-          },
-        ],
-      };
-    }
-
-    case 'context_set_project_dir': {
-      const { projectDir } = args;
-      const sessionId = ensureSession();
-
-      if (!projectDir) {
-        throw new Error('Project directory path is required');
-      }
-
-      // Verify the directory exists
-      if (!fs.existsSync(projectDir)) {
         return {
           content: [
             {
               type: 'text',
-              text: `Error: Directory not found: ${projectDir}`,
+              text: statusMessage,
             },
           ],
         };
       }
 
-      // Update the current session's working directory
-      repositories.sessions.update(sessionId, { working_directory: projectDir });
+      case 'context_set_project_dir': {
+        const { projectDir } = args;
+        const sessionId = ensureSession();
 
-      // Try to get git info to verify it's a git repo
-      let gitInfo = 'No git repository found';
-      try {
-        const git = simpleGit(projectDir);
-        const branchInfo = await git.branch();
-        const status = await git.status();
-        gitInfo = `Git repository detected\nBranch: ${branchInfo.current}\nStatus: ${status.modified.length} modified, ${status.created.length} new, ${status.deleted.length} deleted`;
-      } catch (_e) {
-        // Not a git repo, that's okay
+        if (!projectDir) {
+          throw new Error('Project directory path is required');
+        }
+
+        // Verify the directory exists
+        if (!fs.existsSync(projectDir)) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Error: Directory not found: ${projectDir}`,
+              },
+            ],
+          };
+        }
+
+        // Update the current session's working directory
+        repositories.sessions.update(sessionId, { working_directory: projectDir });
+
+        // Try to get git info to verify it's a git repo
+        let gitInfo = 'No git repository found';
+        try {
+          const git = simpleGit(projectDir);
+          const branchInfo = await git.branch();
+          const status = await git.status();
+          gitInfo = `Git repository detected\nBranch: ${branchInfo.current}\nStatus: ${status.modified.length} modified, ${status.created.length} new, ${status.deleted.length} deleted`;
+        } catch (_e) {
+          // Not a git repo, that's okay
+        }
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Project directory set for session ${sessionId.substring(0, 8)}: ${projectDir}\n\n${gitInfo}`,
+            },
+          ],
+        };
       }
 
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Project directory set for session ${sessionId.substring(0, 8)}: ${projectDir}\n\n${gitInfo}`,
-          },
-        ],
-      };
-    }
-
-    case 'context_session_list': {
-      const { limit = 10 } = args;
-      const sessions = db
-        .prepare(
-          `
+      case 'context_session_list': {
+        const { limit = 10 } = args;
+        const sessions = db
+          .prepare(
+            `
         SELECT id, name, description, branch, created_at,
                (SELECT COUNT(*) FROM context_items WHERE session_id = sessions.id) as item_count
         FROM sessions
         ORDER BY created_at DESC
         LIMIT ?
       `
-        )
-        .all(limit);
+          )
+          .all(limit);
 
-      const sessionList = sessions
-        .map(
-          (s: any) =>
-            `• ${s.name} (${s.id.substring(0, 8)})\n  Created: ${s.created_at}\n  Items: ${s.item_count}\n  Branch: ${s.branch || 'unknown'}`
-        )
-        .join('\n\n');
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Recent sessions:\n\n${sessionList}`,
-          },
-        ],
-      };
-    }
-
-    // Enhanced Context Storage
-    case 'context_save': {
-      const {
-        key,
-        value,
-        category,
-        priority = 'normal',
-        private: isPrivate = false,
-        channel,
-      } = args;
-
-      try {
-        const sessionId = ensureSession();
-
-        // Verify session exists before saving context
-        const session = repositories.sessions.getById(sessionId);
-        if (!session) {
-          // Session was deleted or corrupted, create a new one
-          console.warn(`Session ${sessionId} not found, creating new session`);
-          const newSession = repositories.sessions.create({
-            name: 'Recovery Session',
-            description: 'Auto-created after session corruption',
-          });
-          currentSessionId = newSession.id;
-          const _contextItem = repositories.contexts.save(newSession.id, {
-            key,
-            value,
-            category,
-            priority: priority as 'high' | 'normal' | 'low',
-            isPrivate,
-            channel,
-          });
-
-          return {
-            content: [
-              {
-                type: 'text',
-                text: `Saved: ${key}\nCategory: ${category || 'none'}\nPriority: ${priority}\nSession: ${newSession.id.substring(0, 8)} (recovered)`,
-              },
-            ],
-          };
-        }
-
-        const contextItem = repositories.contexts.save(sessionId, {
-          key,
-          value,
-          category,
-          priority: priority as 'high' | 'normal' | 'low',
-          isPrivate,
-          channel,
-        });
-
-        // Create embedding for semantic search
-        try {
-          const content = `${key}: ${value}`;
-          const metadata = { key, category, priority };
-          await vectorStore.storeDocument(contextItem.id, content, metadata);
-        } catch (error) {
-          // Log but don't fail the save operation
-          console.error('Failed to create embedding:', error);
-        }
+        const sessionList = sessions
+          .map(
+            (s: any) =>
+              `• ${s.name} (${s.id.substring(0, 8)})\n  Created: ${s.created_at}\n  Items: ${s.item_count}\n  Branch: ${s.branch || 'unknown'}`
+          )
+          .join('\n\n');
 
         return {
           content: [
             {
               type: 'text',
-              text: `Saved: ${key}\nCategory: ${category || 'none'}\nPriority: ${priority}\nChannel: ${contextItem.channel || 'general'}\nSession: ${sessionId.substring(0, 8)}`,
+              text: `Recent sessions:\n\n${sessionList}`,
             },
           ],
         };
-      } catch (error: any) {
-        console.error('Context save error:', error);
+      }
 
-        // If it's a foreign key constraint error, try recovery
-        if (error.message?.includes('FOREIGN KEY constraint failed')) {
-          try {
-            console.warn('Foreign key constraint failed, attempting recovery...');
+      // Enhanced Context Storage
+      case 'context_save': {
+        const {
+          key,
+          value,
+          category,
+          priority = 'normal',
+          private: isPrivate = false,
+          channel,
+        } = args;
+
+        try {
+          const sessionId = ensureSession();
+
+          // Verify session exists before saving context
+          const session = repositories.sessions.getById(sessionId);
+          if (!session) {
+            // Session was deleted or corrupted, create a new one
+            console.warn(`Session ${sessionId} not found, creating new session`);
             const newSession = repositories.sessions.create({
-              name: 'Emergency Recovery Session',
-              description: 'Created due to foreign key constraint failure',
+              name: 'Recovery Session',
+              description: 'Auto-created after session corruption',
             });
             currentSessionId = newSession.id;
-
             const _contextItem = repositories.contexts.save(newSession.id, {
               key,
               value,
@@ -636,185 +699,282 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
               content: [
                 {
                   type: 'text',
-                  text: `Saved: ${key}\nCategory: ${category || 'none'}\nPriority: ${priority}\nSession: ${newSession.id.substring(0, 8)} (emergency recovery)`,
-                },
-              ],
-            };
-          } catch (recoveryError: any) {
-            return {
-              content: [
-                {
-                  type: 'text',
-                  text: `Failed to save context item: ${recoveryError.message}`,
+                  text: `Saved: ${key}\nCategory: ${category || 'none'}\nPriority: ${priority}\nSession: ${newSession.id.substring(0, 8)} (recovered)`,
                 },
               ],
             };
           }
-        }
 
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Failed to save context item: ${error.message}`,
-            },
-          ],
-        };
-      }
-    }
+          const contextItem = repositories.contexts.save(sessionId, {
+            key,
+            value,
+            category,
+            priority: priority as 'high' | 'normal' | 'low',
+            isPrivate,
+            channel,
+          });
 
-    case 'context_get': {
-      const {
-        key,
-        category,
-        channel,
-        channels,
-        sessionId: specificSessionId,
-        includeMetadata,
-        sort,
-        limit: rawLimit,
-        offset: rawOffset,
-        createdAfter,
-        createdBefore,
-        keyPattern,
-        priorities,
-      } = args;
-      const targetSessionId = specificSessionId || currentSessionId || ensureSession();
+          // Create embedding for semantic search
+          try {
+            const content = `${key}: ${value}`;
+            const metadata = { key, category, priority };
+            await vectorStore.storeDocument(contextItem.id, content, metadata);
+          } catch (error) {
+            // Log but don't fail the save operation
+            console.error('Failed to create embedding:', error);
+          }
 
-      // Dynamically calculate safe default limit based on actual data
-      const defaultLimit = calculateDynamicDefaultLimit(targetSessionId, includeMetadata, db);
-      const paginationValidation = validatePaginationParams({
-        limit: rawLimit !== undefined ? rawLimit : defaultLimit,
-        offset: rawOffset,
-      });
-      const { limit, offset, errors: paginationErrors } = paginationValidation;
-
-      // Log pagination validation errors for debugging
-      if (paginationErrors.length > 0) {
-        debugLog('context_get pagination validation errors:', paginationErrors);
-      }
-
-      // Always use enhanced query to ensure consistent pagination
-      // This prevents token limit issues when querying large datasets
-      // Removed the conditional check since we always want to use this path
-      {
-        const result = repositories.contexts.queryEnhanced({
-          sessionId: targetSessionId,
-          key,
-          category,
-          channel,
-          channels,
-          sort,
-          limit,
-          offset,
-          createdAfter,
-          createdBefore,
-          keyPattern,
-          priorities,
-          includeMetadata,
-        });
-
-        if (result.items.length === 0) {
           return {
             content: [
               {
                 type: 'text',
-                text: 'No matching context found',
+                text: `Saved: ${key}\nCategory: ${category || 'none'}\nPriority: ${priority}\nChannel: ${contextItem.channel || 'general'}\nSession: ${sessionId.substring(0, 8)}`,
+              },
+            ],
+          };
+        } catch (error: any) {
+          console.error('Context save error:', error);
+
+          // If it's a foreign key constraint error, try recovery
+          if (error.message?.includes('FOREIGN KEY constraint failed')) {
+            try {
+              console.warn('Foreign key constraint failed, attempting recovery...');
+              const newSession = repositories.sessions.create({
+                name: 'Emergency Recovery Session',
+                description: 'Created due to foreign key constraint failure',
+              });
+              currentSessionId = newSession.id;
+
+              const _contextItem = repositories.contexts.save(newSession.id, {
+                key,
+                value,
+                category,
+                priority: priority as 'high' | 'normal' | 'low',
+                isPrivate,
+                channel,
+              });
+
+              return {
+                content: [
+                  {
+                    type: 'text',
+                    text: `Saved: ${key}\nCategory: ${category || 'none'}\nPriority: ${priority}\nSession: ${newSession.id.substring(0, 8)} (emergency recovery)`,
+                  },
+                ],
+              };
+            } catch (recoveryError: any) {
+              return {
+                content: [
+                  {
+                    type: 'text',
+                    text: `Failed to save context item: ${recoveryError.message}`,
+                  },
+                ],
+              };
+            }
+          }
+
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Failed to save context item: ${error.message}`,
               },
             ],
           };
         }
+      }
 
-        // Use dynamic token limit checking
-        const tokenConfig = getTokenConfig();
-        const { exceedsLimit, estimatedTokens, safeItemCount } = checkTokenLimit(
-          result.items,
+      case 'context_get': {
+        const {
+          key,
+          category,
+          channel,
+          channels,
+          sessionId: specificSessionId,
           includeMetadata,
-          tokenConfig
-        );
+          sort,
+          limit: rawLimit,
+          offset: rawOffset,
+          createdAfter,
+          createdBefore,
+          keyPattern,
+          priorities,
+        } = args;
+        const targetSessionId = specificSessionId || currentSessionId || ensureSession();
 
-        let actualItems = result.items;
-        let wasTruncated = false;
-        let truncatedCount = 0;
+        // Dynamically calculate safe default limit based on actual data
+        const defaultLimit = calculateDynamicDefaultLimit(targetSessionId, includeMetadata, db);
+        const paginationValidation = validatePaginationParams({
+          limit: rawLimit !== undefined ? rawLimit : defaultLimit,
+          offset: rawOffset,
+        });
+        const { limit, offset, errors: paginationErrors } = paginationValidation;
 
-        if (exceedsLimit) {
-          // Truncate to safe item count
-          if (safeItemCount < result.items.length) {
-            actualItems = result.items.slice(0, safeItemCount);
-            wasTruncated = true;
-            truncatedCount = result.items.length - safeItemCount;
-
-            debugLog(
-              `Token limit enforcement: Truncating from ${result.items.length} to ${safeItemCount} items`
-            );
-          }
+        // Log pagination validation errors for debugging
+        if (paginationErrors.length > 0) {
+          debugLog('context_get pagination validation errors:', paginationErrors);
         }
 
-        // Calculate response metrics for the actual items being returned
-        const metrics = calculateResponseMetrics(actualItems);
+        // Always use enhanced query to ensure consistent pagination
+        // This prevents token limit issues when querying large datasets
+        // Removed the conditional check since we always want to use this path
+        {
+          const result = repositories.contexts.queryEnhanced({
+            sessionId: targetSessionId,
+            key,
+            category,
+            channel,
+            channels,
+            sort,
+            limit,
+            offset,
+            createdAfter,
+            createdBefore,
+            keyPattern,
+            priorities,
+            includeMetadata,
+          });
 
-        // Calculate pagination metadata
-        // Use the validated limit and offset from paginationValidation
-        const effectiveLimit = limit; // Already validated and defaulted
-        const effectiveOffset = offset; // Already validated and defaulted
-        const currentPage =
-          effectiveLimit > 0 ? Math.floor(effectiveOffset / effectiveLimit) + 1 : 1;
-        const totalPages = effectiveLimit > 0 ? Math.ceil(result.totalCount / effectiveLimit) : 1;
+          if (result.items.length === 0) {
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: 'No matching context found',
+                },
+              ],
+            };
+          }
 
-        // Update pagination to account for truncation
-        const hasNextPage = wasTruncated || currentPage < totalPages;
-        const hasPreviousPage = currentPage > 1;
+          // Use dynamic token limit checking
+          const tokenConfig = getTokenConfig();
+          const { exceedsLimit, estimatedTokens, safeItemCount } = checkTokenLimit(
+            result.items,
+            includeMetadata,
+            tokenConfig
+          );
 
-        // Calculate next offset accounting for truncation
-        const nextOffset = hasNextPage
-          ? wasTruncated
-            ? effectiveOffset + actualItems.length
-            : effectiveOffset + effectiveLimit
-          : null;
+          let actualItems = result.items;
+          let wasTruncated = false;
+          let truncatedCount = 0;
 
-        // Track whether defaults were applied
-        const defaultsApplied = {
-          limit: rawLimit === undefined,
-          sort: sort === undefined,
-        };
+          if (exceedsLimit) {
+            // Truncate to safe item count
+            if (safeItemCount < result.items.length) {
+              actualItems = result.items.slice(0, safeItemCount);
+              wasTruncated = true;
+              truncatedCount = result.items.length - safeItemCount;
 
-        // Enhanced response format
-        if (includeMetadata) {
-          const itemsWithMetadata = actualItems.map(item => ({
-            key: item.key,
-            value: item.value,
-            category: item.category,
-            priority: item.priority,
-            channel: item.channel,
-            metadata: item.metadata ? JSON.parse(item.metadata) : null,
-            size: item.size || calculateSize(item.value),
-            created_at: item.created_at,
-            updated_at: item.updated_at,
-          }));
+              debugLog(
+                `Token limit enforcement: Truncating from ${result.items.length} to ${safeItemCount} items`
+              );
+            }
+          }
 
+          // Calculate response metrics for the actual items being returned
+          const metrics = calculateResponseMetrics(actualItems);
+
+          // Calculate pagination metadata
+          // Use the validated limit and offset from paginationValidation
+          const effectiveLimit = limit; // Already validated and defaulted
+          const effectiveOffset = offset; // Already validated and defaulted
+          const currentPage =
+            effectiveLimit > 0 ? Math.floor(effectiveOffset / effectiveLimit) + 1 : 1;
+          const totalPages = effectiveLimit > 0 ? Math.ceil(result.totalCount / effectiveLimit) : 1;
+
+          // Update pagination to account for truncation
+          const hasNextPage = wasTruncated || currentPage < totalPages;
+          const hasPreviousPage = currentPage > 1;
+
+          // Calculate next offset accounting for truncation
+          const nextOffset = hasNextPage
+            ? wasTruncated
+              ? effectiveOffset + actualItems.length
+              : effectiveOffset + effectiveLimit
+            : null;
+
+          // Track whether defaults were applied
+          const defaultsApplied = {
+            limit: rawLimit === undefined,
+            sort: sort === undefined,
+          };
+
+          // Enhanced response format
+          if (includeMetadata) {
+            const itemsWithMetadata = actualItems.map(item => ({
+              key: item.key,
+              value: item.value,
+              category: item.category,
+              priority: item.priority,
+              channel: item.channel,
+              metadata: item.metadata ? JSON.parse(item.metadata) : null,
+              size: item.size || calculateSize(item.value),
+              created_at: item.created_at,
+              updated_at: item.updated_at,
+            }));
+
+            const response: any = {
+              items: itemsWithMetadata,
+              pagination: {
+                total: result.totalCount,
+                returned: actualItems.length,
+                offset: effectiveOffset,
+                hasMore: hasNextPage,
+                nextOffset: nextOffset,
+                // Extended pagination metadata
+                totalCount: result.totalCount,
+                page: currentPage,
+                pageSize: effectiveLimit,
+                totalPages: totalPages,
+                hasNextPage: hasNextPage,
+                hasPreviousPage: hasPreviousPage,
+                previousOffset: hasPreviousPage
+                  ? Math.max(0, effectiveOffset - effectiveLimit)
+                  : null,
+                // Size information
+                totalSize: metrics.totalSize,
+                averageSize: metrics.averageSize,
+                // Defaults applied
+                defaultsApplied: defaultsApplied,
+                // Truncation information
+                truncated: wasTruncated,
+                truncatedCount: truncatedCount,
+              },
+            };
+
+            // Add warning if truncation occurred
+            if (wasTruncated) {
+              response.pagination.warning = `Response truncated to prevent token overflow (estimated ${estimatedTokens} tokens). ${truncatedCount} items omitted. Use pagination with offset=${nextOffset} to retrieve remaining items.`;
+              response.pagination.tokenInfo = {
+                estimatedTokens,
+                maxAllowed: tokenConfig.mcpMaxTokens,
+                safeLimit: Math.floor(tokenConfig.mcpMaxTokens * tokenConfig.safetyBuffer),
+              };
+            } else if (estimatedTokens > tokenConfig.mcpMaxTokens * TOKEN_WARNING_THRESHOLD) {
+              response.pagination.warning =
+                'Large result set approaching token limits. Consider using smaller limit or more specific filters.';
+            }
+
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify(response, null, 2),
+                },
+              ],
+            };
+          }
+
+          // Return enhanced format for all queries to support pagination
           const response: any = {
-            items: itemsWithMetadata,
+            items: actualItems,
             pagination: {
               total: result.totalCount,
               returned: actualItems.length,
               offset: effectiveOffset,
               hasMore: hasNextPage,
               nextOffset: nextOffset,
-              // Extended pagination metadata
-              totalCount: result.totalCount,
-              page: currentPage,
-              pageSize: effectiveLimit,
-              totalPages: totalPages,
-              hasNextPage: hasNextPage,
-              hasPreviousPage: hasPreviousPage,
-              previousOffset: hasPreviousPage
-                ? Math.max(0, effectiveOffset - effectiveLimit)
-                : null,
-              // Size information
-              totalSize: metrics.totalSize,
-              averageSize: metrics.averageSize,
-              // Defaults applied
-              defaultsApplied: defaultsApplied,
               // Truncation information
               truncated: wasTruncated,
               truncatedCount: truncatedCount,
@@ -823,12 +983,7 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
 
           // Add warning if truncation occurred
           if (wasTruncated) {
-            response.pagination.warning = `Response truncated to prevent token overflow (estimated ${estimatedTokens} tokens). ${truncatedCount} items omitted. Use pagination with offset=${nextOffset} to retrieve remaining items.`;
-            response.pagination.tokenInfo = {
-              estimatedTokens,
-              maxAllowed: tokenConfig.mcpMaxTokens,
-              safeLimit: Math.floor(tokenConfig.mcpMaxTokens * tokenConfig.safetyBuffer),
-            };
+            response.pagination.warning = `Response truncated to prevent token overflow. ${truncatedCount} items omitted. Use pagination with offset=${nextOffset} to retrieve remaining items.`;
           } else if (estimatedTokens > tokenConfig.mcpMaxTokens * TOKEN_WARNING_THRESHOLD) {
             response.pagination.warning =
               'Large result set approaching token limits. Consider using smaller limit or more specific filters.';
@@ -843,133 +998,101 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
             ],
           };
         }
-
-        // Return enhanced format for all queries to support pagination
-        const response: any = {
-          items: actualItems,
-          pagination: {
-            total: result.totalCount,
-            returned: actualItems.length,
-            offset: effectiveOffset,
-            hasMore: hasNextPage,
-            nextOffset: nextOffset,
-            // Truncation information
-            truncated: wasTruncated,
-            truncatedCount: truncatedCount,
-          },
-        };
-
-        // Add warning if truncation occurred
-        if (wasTruncated) {
-          response.pagination.warning = `Response truncated to prevent token overflow. ${truncatedCount} items omitted. Use pagination with offset=${nextOffset} to retrieve remaining items.`;
-        } else if (estimatedTokens > tokenConfig.mcpMaxTokens * TOKEN_WARNING_THRESHOLD) {
-          response.pagination.warning =
-            'Large result set approaching token limits. Consider using smaller limit or more specific filters.';
-        }
-
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(response, null, 2),
-            },
-          ],
-        };
       }
-    }
 
-    // File Caching
-    case 'context_cache_file': {
-      const { filePath, content } = args;
-      const sessionId = ensureSession();
-      const hash = calculateFileHash(content);
+      // File Caching
+      case 'context_cache_file': {
+        const { filePath, content } = args;
+        const sessionId = ensureSession();
+        const hash = calculateFileHash(content);
 
-      const stmt = db.prepare(`
+        const stmt = db.prepare(`
         INSERT OR REPLACE INTO file_cache (id, session_id, file_path, content, hash)
         VALUES (?, ?, ?, ?, ?)
       `);
 
-      stmt.run(uuidv4(), sessionId, filePath, content, hash);
+        stmt.run(uuidv4(), sessionId, filePath, content, hash);
 
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Cached file: ${filePath}\nHash: ${hash.substring(0, 16)}...\nSize: ${content.length} bytes`,
-          },
-        ],
-      };
-    }
-
-    case 'context_file_changed': {
-      const { filePath, currentContent } = args;
-      const sessionId = ensureSession();
-
-      const cached = db
-        .prepare('SELECT hash, content FROM file_cache WHERE session_id = ? AND file_path = ?')
-        .get(sessionId, filePath) as any;
-
-      if (!cached) {
         return {
           content: [
             {
               type: 'text',
-              text: `No cached version found for: ${filePath}`,
+              text: `Cached file: ${filePath}\nHash: ${hash.substring(0, 16)}...\nSize: ${content.length} bytes`,
             },
           ],
         };
       }
 
-      const currentHash = currentContent ? calculateFileHash(currentContent) : null;
-      const hasChanged = currentHash !== cached.hash;
+      case 'context_file_changed': {
+        const { filePath, currentContent } = args;
+        const sessionId = ensureSession();
 
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `File: ${filePath}\nChanged: ${hasChanged}\nCached hash: ${cached.hash.substring(0, 16)}...\nCurrent hash: ${currentHash ? currentHash.substring(0, 16) + '...' : 'N/A'}`,
-          },
-        ],
-      };
-    }
+        const cached = db
+          .prepare('SELECT hash, content FROM file_cache WHERE session_id = ? AND file_path = ?')
+          .get(sessionId, filePath) as any;
 
-    case 'context_status': {
-      const sessionId = currentSessionId || ensureSession();
+        if (!cached) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `No cached version found for: ${filePath}`,
+              },
+            ],
+          };
+        }
 
-      const stats = db
-        .prepare(
-          `
+        const currentHash = currentContent ? calculateFileHash(currentContent) : null;
+        const hasChanged = currentHash !== cached.hash;
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `File: ${filePath}\nChanged: ${hasChanged}\nCached hash: ${cached.hash.substring(0, 16)}...\nCurrent hash: ${currentHash ? currentHash.substring(0, 16) + '...' : 'N/A'}`,
+            },
+          ],
+        };
+      }
+
+      case 'context_status': {
+        const sessionId = currentSessionId || ensureSession();
+
+        const stats = db
+          .prepare(
+            `
         SELECT 
           (SELECT COUNT(*) FROM context_items WHERE session_id = ?) as item_count,
           (SELECT COUNT(*) FROM file_cache WHERE session_id = ?) as file_count,
           (SELECT created_at FROM sessions WHERE id = ?) as session_created,
           (SELECT name FROM sessions WHERE id = ?) as session_name
       `
-        )
-        .get(sessionId, sessionId, sessionId, sessionId) as any;
+          )
+          .get(sessionId, sessionId, sessionId, sessionId) as any;
 
-      const recentItems = db
-        .prepare(
-          `
+        const recentItems = db
+          .prepare(
+            `
         SELECT key, category, priority FROM context_items 
         WHERE session_id = ? 
         ORDER BY created_at DESC 
         LIMIT 5
       `
-        )
-        .all(sessionId);
+          )
+          .all(sessionId);
 
-      const recentList = recentItems
-        .map(
-          (item: any) => `  • [${item.priority}] ${item.key} (${item.category || 'uncategorized'})`
-        )
-        .join('\n');
+        const recentList = recentItems
+          .map(
+            (item: any) =>
+              `  • [${item.priority}] ${item.key} (${item.category || 'uncategorized'})`
+          )
+          .join('\n');
 
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Current Session: ${stats.session_name}
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Current Session: ${stats.session_name}
 Session ID: ${sessionId.substring(0, 8)}
 Created: ${stats.session_created}
 Context Items: ${stats.item_count}
@@ -977,201 +1100,259 @@ Cached Files: ${stats.file_count}
 
 Recent Items:
 ${recentList || '  None'}`,
-          },
-        ],
-      };
-    }
-
-    // Phase 2: Checkpoint System
-    case 'context_checkpoint': {
-      const { name, description, includeFiles = true, includeGitStatus = true } = args;
-      const sessionId = ensureSession();
-      const checkpointId = uuidv4();
-
-      // Get git status if requested
-      let gitStatus = null;
-      let gitBranch = null;
-      if (includeGitStatus) {
-        const gitInfo = await getGitStatus();
-        gitStatus = gitInfo.status;
-        gitBranch = gitInfo.branch;
+            },
+          ],
+        };
       }
 
-      // Create checkpoint
-      db.prepare(
-        `
+      case 'context_recovery_status': {
+        const pending = listPendingRecoveryRecords();
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  pendingCount: pending.length,
+                  pending,
+                  guidance:
+                    'Run context_recovery_resolve with pendingId, action=commit|discard, and confirm=true.',
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      case 'context_recovery_resolve': {
+        const { pendingId, action, confirm = false } = args;
+        if (!confirm) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'Resolution blocked. Re-run with confirm=true.',
+              },
+            ],
+          };
+        }
+        if (!pendingId || (action !== 'commit' && action !== 'discard')) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'Invalid arguments. Require pendingId and action="commit"|"discard".',
+              },
+            ],
+            isError: true,
+          };
+        }
+        const resolved = resolveRecoveryRecord(pendingId, action);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: resolved.message,
+            },
+          ],
+          isError: !resolved.ok,
+        };
+      }
+
+      // Phase 2: Checkpoint System
+      case 'context_checkpoint': {
+        const { name, description, includeFiles = true, includeGitStatus = true } = args;
+        const sessionId = ensureSession();
+        const checkpointId = uuidv4();
+
+        // Get git status if requested
+        let gitStatus = null;
+        let gitBranch = null;
+        if (includeGitStatus) {
+          const gitInfo = await getGitStatus();
+          gitStatus = gitInfo.status;
+          gitBranch = gitInfo.branch;
+        }
+
+        // Create checkpoint
+        db.prepare(
+          `
         INSERT INTO checkpoints (id, session_id, name, description, git_status, git_branch)
         VALUES (?, ?, ?, ?, ?, ?)
       `
-      ).run(checkpointId, sessionId, name, description || '', gitStatus, gitBranch);
+        ).run(checkpointId, sessionId, name, description || '', gitStatus, gitBranch);
 
-      // Save context items
-      const contextItems = db
-        .prepare('SELECT id FROM context_items WHERE session_id = ?')
-        .all(sessionId);
-      const itemStmt = db.prepare(
-        'INSERT INTO checkpoint_items (id, checkpoint_id, context_item_id) VALUES (?, ?, ?)'
-      );
-      for (const item of contextItems) {
-        itemStmt.run(uuidv4(), checkpointId, (item as any).id);
-      }
-
-      // Save file cache if requested
-      let fileCount = 0;
-      if (includeFiles) {
-        const files = db.prepare('SELECT id FROM file_cache WHERE session_id = ?').all(sessionId);
-        const fileStmt = db.prepare(
-          'INSERT INTO checkpoint_files (id, checkpoint_id, file_cache_id) VALUES (?, ?, ?)'
+        // Save context items
+        const contextItems = db
+          .prepare('SELECT id FROM context_items WHERE session_id = ?')
+          .all(sessionId);
+        const itemStmt = db.prepare(
+          'INSERT INTO checkpoint_items (id, checkpoint_id, context_item_id) VALUES (?, ?, ?)'
         );
-        for (const file of files) {
-          fileStmt.run(uuidv4(), checkpointId, (file as any).id);
-          fileCount++;
+        for (const item of contextItems) {
+          itemStmt.run(uuidv4(), checkpointId, (item as any).id);
         }
-      }
 
-      let statusText = `Created checkpoint: ${name}
+        // Save file cache if requested
+        let fileCount = 0;
+        if (includeFiles) {
+          const files = db.prepare('SELECT id FROM file_cache WHERE session_id = ?').all(sessionId);
+          const fileStmt = db.prepare(
+            'INSERT INTO checkpoint_files (id, checkpoint_id, file_cache_id) VALUES (?, ?, ?)'
+          );
+          for (const file of files) {
+            fileStmt.run(uuidv4(), checkpointId, (file as any).id);
+            fileCount++;
+          }
+        }
+
+        let statusText = `Created checkpoint: ${name}
 ID: ${checkpointId.substring(0, 8)}
 Context items: ${contextItems.length}
 Cached files: ${fileCount}
 Git branch: ${gitBranch || 'none'}
 Git status: ${gitStatus ? 'captured' : 'not captured'}`;
 
-      // Add helpful message if git status was requested but no project directory is set
-      const currentSession = repositories.sessions.getById(sessionId);
-      if (includeGitStatus && (!currentSession || !currentSession.working_directory)) {
-        statusText += `\n\n💡 Note: Git status was requested but no project directory is set.
+        // Add helpful message if git status was requested but no project directory is set
+        const currentSession = repositories.sessions.getById(sessionId);
+        if (includeGitStatus && (!currentSession || !currentSession.working_directory)) {
+          statusText += `\n\n💡 Note: Git status was requested but no project directory is set.
 To enable git tracking, use context_set_project_dir with your project path.`;
-      }
+        }
 
-      return {
-        content: [
-          {
-            type: 'text',
-            text: statusText,
-          },
-        ],
-      };
-    }
-
-    case 'context_restore_checkpoint': {
-      const { name, checkpointId, restoreFiles = true } = args;
-
-      // Find checkpoint
-      let checkpoint;
-      if (checkpointId) {
-        checkpoint = db.prepare('SELECT * FROM checkpoints WHERE id = ?').get(checkpointId);
-      } else if (name) {
-        checkpoint = db
-          .prepare('SELECT * FROM checkpoints ORDER BY created_at DESC')
-          .all()
-          .find((cp: any) => cp.name === name);
-      } else {
-        // Get latest checkpoint
-        checkpoint = db.prepare('SELECT * FROM checkpoints ORDER BY created_at DESC LIMIT 1').get();
-      }
-
-      if (!checkpoint) {
         return {
           content: [
             {
               type: 'text',
-              text: 'No checkpoint found',
+              text: statusText,
             },
           ],
         };
       }
 
-      const cp = checkpoint as any;
+      case 'context_restore_checkpoint': {
+        const { name, checkpointId, restoreFiles = true } = args;
 
-      // Start new session from checkpoint
-      const newSessionId = uuidv4();
-      db.prepare(
-        `
+        // Find checkpoint
+        let checkpoint;
+        if (checkpointId) {
+          checkpoint = db.prepare('SELECT * FROM checkpoints WHERE id = ?').get(checkpointId);
+        } else if (name) {
+          checkpoint = db
+            .prepare('SELECT * FROM checkpoints ORDER BY created_at DESC')
+            .all()
+            .find((cp: any) => cp.name === name);
+        } else {
+          // Get latest checkpoint
+          checkpoint = db
+            .prepare('SELECT * FROM checkpoints ORDER BY created_at DESC LIMIT 1')
+            .get();
+        }
+
+        if (!checkpoint) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'No checkpoint found',
+              },
+            ],
+          };
+        }
+
+        const cp = checkpoint as any;
+
+        // Start new session from checkpoint
+        const newSessionId = uuidv4();
+        db.prepare(
+          `
         INSERT INTO sessions (id, name, description, branch, working_directory)
         VALUES (?, ?, ?, ?, ?)
       `
-      ).run(
-        newSessionId,
-        `Restored from: ${cp.name}`,
-        `Checkpoint ${cp.id.substring(0, 8)} created at ${cp.created_at}`,
-        cp.git_branch,
-        null
-      );
+        ).run(
+          newSessionId,
+          `Restored from: ${cp.name}`,
+          `Checkpoint ${cp.id.substring(0, 8)} created at ${cp.created_at}`,
+          cp.git_branch,
+          null
+        );
 
-      // Restore context items
-      const contextItems = db
-        .prepare(
-          `
+        // Restore context items
+        const contextItems = db
+          .prepare(
+            `
         SELECT ci.* FROM context_items ci
         JOIN checkpoint_items cpi ON ci.id = cpi.context_item_id
         WHERE cpi.checkpoint_id = ?
       `
-        )
-        .all(cp.id);
+          )
+          .all(cp.id);
 
-      const itemStmt = db.prepare(`
+        const itemStmt = db.prepare(`
         INSERT INTO context_items (id, session_id, key, value, category, priority, size, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))
       `);
 
-      for (const item of contextItems) {
-        const itemData = item as any;
-        itemStmt.run(
-          uuidv4(),
-          newSessionId,
-          itemData.key,
-          itemData.value,
-          itemData.category,
-          itemData.priority,
-          itemData.size || calculateSize(itemData.value),
-          itemData.created_at
-        );
-      }
+        for (const item of contextItems) {
+          const itemData = item as any;
+          itemStmt.run(
+            uuidv4(),
+            newSessionId,
+            itemData.key,
+            itemData.value,
+            itemData.category,
+            itemData.priority,
+            itemData.size || calculateSize(itemData.value),
+            itemData.created_at
+          );
+        }
 
-      // Restore file cache if requested
-      let fileCount = 0;
-      if (restoreFiles) {
-        const files = db
-          .prepare(
-            `
+        // Restore file cache if requested
+        let fileCount = 0;
+        if (restoreFiles) {
+          const files = db
+            .prepare(
+              `
           SELECT fc.* FROM file_cache fc
           JOIN checkpoint_files cpf ON fc.id = cpf.file_cache_id
           WHERE cpf.checkpoint_id = ?
         `
-          )
-          .all(cp.id);
+            )
+            .all(cp.id);
 
-        const fileStmt = db.prepare(`
+          const fileStmt = db.prepare(`
           INSERT INTO file_cache (id, session_id, file_path, content, hash, last_read)
           VALUES (?, ?, ?, ?, ?, ?)
         `);
 
-        for (const file of files) {
-          fileStmt.run(
-            uuidv4(),
-            newSessionId,
-            (file as any).file_path,
-            (file as any).content,
-            (file as any).hash,
-            (file as any).last_read
-          );
-          fileCount++;
+          for (const file of files) {
+            fileStmt.run(
+              uuidv4(),
+              newSessionId,
+              (file as any).file_path,
+              (file as any).content,
+              (file as any).hash,
+              (file as any).last_read
+            );
+            fileCount++;
+          }
         }
-      }
 
-      currentSessionId = newSessionId;
+        currentSessionId = newSessionId;
 
-      // Get session information for enhanced messaging
-      const sessionCount = db.prepare('SELECT COUNT(*) as count FROM sessions').get() as any;
-      const originalSession = db
-        .prepare('SELECT name FROM sessions WHERE id = ?')
-        .get(cp.session_id) as any;
+        // Get session information for enhanced messaging
+        const sessionCount = db.prepare('SELECT COUNT(*) as count FROM sessions').get() as any;
+        const originalSession = db
+          .prepare('SELECT name FROM sessions WHERE id = ?')
+          .get(cp.session_id) as any;
 
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `✅ Successfully restored from checkpoint: ${cp.name}
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `✅ Successfully restored from checkpoint: ${cp.name}
 
 🔄 Data Safety: A new session was created to preserve your current work
 📋 New Session: ${newSessionId.substring(0, 8)} ("${`Restored from: ${cp.name}`}")
@@ -1190,165 +1371,165 @@ To enable git tracking, use context_set_project_dir with your project path.`;
 - Switch sessions anytime without losing data
 
 🆘 Need your previous work? Use context_search_all to find items across sessions`,
-          },
-        ],
-      };
-    }
+            },
+          ],
+        };
+      }
 
-    // Phase 2: Summarization
-    case 'context_summarize': {
-      const { sessionId: specificSessionId, categories, maxLength } = args;
-      const targetSessionId = specificSessionId || currentSessionId || ensureSession();
+      // Phase 2: Summarization
+      case 'context_summarize': {
+        const { sessionId: specificSessionId, categories, maxLength } = args;
+        const targetSessionId = specificSessionId || currentSessionId || ensureSession();
 
-      const items = db
-        .prepare(
-          `
+        const items = db
+          .prepare(
+            `
         SELECT * FROM context_items 
         WHERE session_id = ? 
         ORDER BY priority DESC, created_at DESC
       `
-        )
-        .all(targetSessionId);
+          )
+          .all(targetSessionId);
 
-      const summary = createSummary(items, { categories, maxLength });
+        const summary = createSummary(items, { categories, maxLength });
 
-      return {
-        content: [
-          {
-            type: 'text',
-            text: summary,
-          },
-        ],
-      };
-    }
+        return {
+          content: [
+            {
+              type: 'text',
+              text: summary,
+            },
+          ],
+        };
+      }
 
-    // Phase 3: Smart Compaction Helper
-    case 'context_prepare_compaction': {
-      const sessionId = ensureSession();
+      // Phase 3: Smart Compaction Helper
+      case 'context_prepare_compaction': {
+        const sessionId = ensureSession();
 
-      // Get all high priority items
-      const highPriorityItems = db
-        .prepare(
-          `
+        // Get all high priority items
+        const highPriorityItems = db
+          .prepare(
+            `
         SELECT * FROM context_items 
         WHERE session_id = ? AND priority = 'high'
         ORDER BY created_at DESC
       `
-        )
-        .all(sessionId);
+          )
+          .all(sessionId);
 
-      // Get recent tasks
-      const recentTasks = db
-        .prepare(
-          `
+        // Get recent tasks
+        const recentTasks = db
+          .prepare(
+            `
         SELECT * FROM context_items 
         WHERE session_id = ? AND category = 'task'
         ORDER BY created_at DESC LIMIT 10
       `
-        )
-        .all(sessionId);
+          )
+          .all(sessionId);
 
-      // Get all decisions
-      const decisions = db
-        .prepare(
-          `
+        // Get all decisions
+        const decisions = db
+          .prepare(
+            `
         SELECT * FROM context_items 
         WHERE session_id = ? AND category = 'decision'
         ORDER BY created_at DESC
       `
-        )
-        .all(sessionId);
+          )
+          .all(sessionId);
 
-      // Get files that changed
-      const changedFiles = db
-        .prepare(
-          `
+        // Get files that changed
+        const changedFiles = db
+          .prepare(
+            `
         SELECT file_path, hash FROM file_cache 
         WHERE session_id = ?
       `
-        )
-        .all(sessionId);
+          )
+          .all(sessionId);
 
-      // Auto-create checkpoint
-      const checkpointId = uuidv4();
-      const checkpointName = `auto-compaction-${new Date().toISOString()}`;
+        // Auto-create checkpoint
+        const checkpointId = uuidv4();
+        const checkpointName = `auto-compaction-${new Date().toISOString()}`;
 
-      const gitInfo = await getGitStatus();
+        const gitInfo = await getGitStatus();
 
-      db.prepare(
-        `
+        db.prepare(
+          `
         INSERT INTO checkpoints (id, session_id, name, description, git_status, git_branch)
         VALUES (?, ?, ?, ?, ?, ?)
       `
-      ).run(
-        checkpointId,
-        sessionId,
-        checkpointName,
-        'Automatic checkpoint before compaction',
-        gitInfo.status,
-        gitInfo.branch
-      );
+        ).run(
+          checkpointId,
+          sessionId,
+          checkpointName,
+          'Automatic checkpoint before compaction',
+          gitInfo.status,
+          gitInfo.branch
+        );
 
-      // Save all context items to checkpoint
-      const allItems = db
-        .prepare('SELECT id FROM context_items WHERE session_id = ?')
-        .all(sessionId);
-      const itemStmt = db.prepare(
-        'INSERT INTO checkpoint_items (id, checkpoint_id, context_item_id) VALUES (?, ?, ?)'
-      );
-      for (const item of allItems) {
-        itemStmt.run(uuidv4(), checkpointId, (item as any).id);
-      }
+        // Save all context items to checkpoint
+        const allItems = db
+          .prepare('SELECT id FROM context_items WHERE session_id = ?')
+          .all(sessionId);
+        const itemStmt = db.prepare(
+          'INSERT INTO checkpoint_items (id, checkpoint_id, context_item_id) VALUES (?, ?, ?)'
+        );
+        for (const item of allItems) {
+          itemStmt.run(uuidv4(), checkpointId, (item as any).id);
+        }
 
-      // Generate summary for next session
-      const summary = createSummary([...highPriorityItems, ...recentTasks, ...decisions], {
-        maxLength: 2000,
-      });
+        // Generate summary for next session
+        const summary = createSummary([...highPriorityItems, ...recentTasks, ...decisions], {
+          maxLength: 2000,
+        });
 
-      // Determine next steps
-      const nextSteps: string[] = [];
-      const unfinishedTasks = recentTasks.filter(
-        (t: any) =>
-          !t.value.toLowerCase().includes('completed') && !t.value.toLowerCase().includes('done')
-      );
+        // Determine next steps
+        const nextSteps: string[] = [];
+        const unfinishedTasks = recentTasks.filter(
+          (t: any) =>
+            !t.value.toLowerCase().includes('completed') && !t.value.toLowerCase().includes('done')
+        );
 
-      unfinishedTasks.forEach((task: any) => {
-        nextSteps.push(`Continue: ${task.key}`);
-      });
+        unfinishedTasks.forEach((task: any) => {
+          nextSteps.push(`Continue: ${task.key}`);
+        });
 
-      // Save prepared context
-      const preparedContext = {
-        checkpoint: checkpointName,
-        summary,
-        nextSteps,
-        criticalItems: highPriorityItems.map((i: any) => ({ key: i.key, value: i.value })),
-        decisions: decisions.map((d: any) => ({ key: d.key, value: d.value })),
-        filesModified: changedFiles.length,
-        gitBranch: gitInfo.branch,
-      };
+        // Save prepared context
+        const preparedContext = {
+          checkpoint: checkpointName,
+          summary,
+          nextSteps,
+          criticalItems: highPriorityItems.map((i: any) => ({ key: i.key, value: i.value })),
+          decisions: decisions.map((d: any) => ({ key: d.key, value: d.value })),
+          filesModified: changedFiles.length,
+          gitBranch: gitInfo.branch,
+        };
 
-      // Save as special context item
-      const preparedValue = JSON.stringify(preparedContext);
-      db.prepare(
-        `
+        // Save as special context item
+        const preparedValue = JSON.stringify(preparedContext);
+        db.prepare(
+          `
         INSERT OR REPLACE INTO context_items (id, session_id, key, value, category, priority, size, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))
       `
-      ).run(
-        uuidv4(),
-        sessionId,
-        '_prepared_compaction',
-        preparedValue,
-        'system',
-        'high',
-        calculateSize(preparedValue)
-      );
+        ).run(
+          uuidv4(),
+          sessionId,
+          '_prepared_compaction',
+          preparedValue,
+          'system',
+          'high',
+          calculateSize(preparedValue)
+        );
 
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Prepared for compaction:
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Prepared for compaction:
 
 Checkpoint: ${checkpointName}
 Critical items saved: ${highPriorityItems.length}
@@ -1364,301 +1545,303 @@ ${nextSteps.join('\n')}
 
 To restore after compaction:
 mcp_context_restore_checkpoint({ name: "${checkpointName}" })`,
-          },
-        ],
-      };
-    }
-
-    // Phase 3: Git Integration
-    case 'context_git_commit': {
-      const { message, autoSave = true } = args;
-      const sessionId = ensureSession();
-
-      // Check if project directory is set for this session
-      const session = repositories.sessions.getById(sessionId);
-      if (!session || !session.working_directory) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: getProjectDirectorySetupMessage(),
             },
           ],
         };
       }
 
-      if (autoSave) {
-        // Save current context state
-        const timestamp = new Date().toISOString();
-        const commitValue = message || 'No commit message';
-        db.prepare(
-          `
+      // Phase 3: Git Integration
+      case 'context_git_commit': {
+        const { message, autoSave = true } = args;
+        const sessionId = ensureSession();
+
+        // Check if project directory is set for this session
+        const session = repositories.sessions.getById(sessionId);
+        if (!session || !session.working_directory) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: getProjectDirectorySetupMessage(),
+              },
+            ],
+          };
+        }
+
+        if (autoSave) {
+          // Save current context state
+          const timestamp = new Date().toISOString();
+          const commitValue = message || 'No commit message';
+          db.prepare(
+            `
           INSERT OR REPLACE INTO context_items (id, session_id, key, value, category, priority, size, updated_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))
         `
-        ).run(
-          uuidv4(),
-          sessionId,
-          `commit_${timestamp}`,
-          commitValue,
-          'git',
-          'normal',
-          calculateSize(commitValue)
-        );
+          ).run(
+            uuidv4(),
+            sessionId,
+            `commit_${timestamp}`,
+            commitValue,
+            'git',
+            'normal',
+            calculateSize(commitValue)
+          );
 
-        // Create checkpoint
-        const checkpointId = uuidv4();
-        const checkpointName = `git-commit-${timestamp}`;
-        const gitInfo = await getGitStatus();
+          // Create checkpoint
+          const checkpointId = uuidv4();
+          const checkpointName = `git-commit-${timestamp}`;
+          const gitInfo = await getGitStatus();
 
-        db.prepare(
-          `
+          db.prepare(
+            `
           INSERT INTO checkpoints (id, session_id, name, description, git_status, git_branch)
           VALUES (?, ?, ?, ?, ?, ?)
         `
-        ).run(
-          checkpointId,
-          sessionId,
-          checkpointName,
-          `Git commit: ${message || 'No message'}`,
-          gitInfo.status,
-          gitInfo.branch
-        );
+          ).run(
+            checkpointId,
+            sessionId,
+            checkpointName,
+            `Git commit: ${message || 'No message'}`,
+            gitInfo.status,
+            gitInfo.branch
+          );
 
-        // Link current context to checkpoint
-        const items = db
-          .prepare('SELECT id FROM context_items WHERE session_id = ?')
-          .all(sessionId);
-        const itemStmt = db.prepare(
-          'INSERT INTO checkpoint_items (id, checkpoint_id, context_item_id) VALUES (?, ?, ?)'
-        );
-        for (const item of items) {
-          itemStmt.run(uuidv4(), checkpointId, (item as any).id);
+          // Link current context to checkpoint
+          const items = db
+            .prepare('SELECT id FROM context_items WHERE session_id = ?')
+            .all(sessionId);
+          const itemStmt = db.prepare(
+            'INSERT INTO checkpoint_items (id, checkpoint_id, context_item_id) VALUES (?, ?, ?)'
+          );
+          for (const item of items) {
+            itemStmt.run(uuidv4(), checkpointId, (item as any).id);
+          }
         }
-      }
 
-      // Execute git commit
-      try {
-        const git = simpleGit(session.working_directory);
-        await git.add('.');
-        const commitResult = await git.commit(message || 'Commit via Memory Keeper');
+        // Execute git commit
+        try {
+          const git = simpleGit(session.working_directory);
+          await git.add('.');
+          const commitResult = await git.commit(message || 'Commit via Memory Keeper');
 
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Git commit successful!
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Git commit successful!
 Commit: ${commitResult.commit}
 Context saved: ${autoSave ? 'Yes' : 'No'}
 Checkpoint: ${autoSave ? `git-commit-${new Date().toISOString()}` : 'None'}`,
-            },
-          ],
-        };
-      } catch (error: any) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Git commit failed: ${error.message}`,
-            },
-          ],
-        };
-      }
-    }
-
-    // Phase 3: Context Search
-    case 'context_search': {
-      const {
-        query,
-        searchIn = ['key', 'value'],
-        sessionId: specificSessionId,
-        category,
-        channel,
-        channels,
-        sort,
-        limit,
-        offset,
-        createdAfter,
-        createdBefore,
-        keyPattern,
-        priorities,
-        includeMetadata,
-      } = args;
-      const targetSessionId = specificSessionId || currentSessionId || ensureSession();
-
-      // Use enhanced search for all cases
-      const result = repositories.contexts.searchEnhanced({
-        query,
-        sessionId: targetSessionId,
-        searchIn,
-        category,
-        channel,
-        channels,
-        sort,
-        limit,
-        offset,
-        createdAfter,
-        createdBefore,
-        keyPattern,
-        priorities,
-        includeMetadata,
-      });
-
-      if (result.items.length === 0) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `No results found for: "${query}"`,
-            },
-          ],
-        };
-      }
-
-      // Enhanced response format with metadata
-      if (includeMetadata) {
-        const itemsWithMetadata = result.items.map(item => ({
-          key: item.key,
-          value: item.value,
-          category: item.category,
-          priority: item.priority,
-          channel: item.channel,
-          metadata: item.metadata ? JSON.parse(item.metadata) : null,
-          size: item.size || calculateSize(item.value),
-          created_at: item.created_at,
-          updated_at: item.updated_at,
-        }));
-
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(
-                {
-                  items: itemsWithMetadata,
-                  totalCount: result.totalCount,
-                  page: offset && limit ? Math.floor(offset / limit) + 1 : 1,
-                  pageSize: limit || result.items.length,
-                  query,
-                },
-                null,
-                2
-              ),
-            },
-          ],
-        };
-      }
-
-      // Backward compatible format
-      const resultText = result.items
-        .map(
-          (r: any) =>
-            `• [${r.priority}] ${r.key} (${r.category || 'none'})\n  ${r.value.substring(0, 100)}${r.value.length > 100 ? '...' : ''}`
-        )
-        .join('\n\n');
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Found ${result.items.length} results for "${query}":\n\n${resultText}`,
-          },
-        ],
-      };
-    }
-
-    // Phase 3: Export/Import
-    case 'context_export': {
-      const {
-        sessionId: specificSessionId,
-        format = 'json',
-        includeStats = false,
-        confirmEmpty = false,
-      } = args;
-      const targetSessionId = specificSessionId || currentSessionId;
-
-      // Phase 1: Validation
-      if (!targetSessionId) {
-        throw new Error('No session ID provided and no current session active');
-      }
-
-      // Check if session exists
-      const session = db.prepare('SELECT * FROM sessions WHERE id = ?').get(targetSessionId) as any;
-      if (!session) {
-        throw new Error(`Session not found: ${targetSessionId}`);
-      }
-
-      // Get session data
-      const contextItems = db
-        .prepare('SELECT * FROM context_items WHERE session_id = ?')
-        .all(targetSessionId);
-      const fileCache = db
-        .prepare('SELECT * FROM file_cache WHERE session_id = ?')
-        .all(targetSessionId);
-      const checkpoints = db
-        .prepare('SELECT * FROM checkpoints WHERE session_id = ?')
-        .all(targetSessionId);
-
-      // Check if session is empty
-      const isEmpty =
-        contextItems.length === 0 && fileCache.length === 0 && checkpoints.length === 0;
-      if (isEmpty && !confirmEmpty) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: 'Warning: Session appears to be empty. No context items, files, or checkpoints found.\n\nTo export anyway, use confirmEmpty: true',
-            },
-          ],
-          isEmpty: true,
-          requiresConfirmation: true,
-        };
-      }
-
-      const exportData = {
-        version: '0.4.0',
-        exported: new Date().toISOString(),
-        session,
-        contextItems,
-        fileCache,
-        checkpoints,
-        metadata: {
-          itemCount: contextItems.length,
-          fileCount: fileCache.length,
-          checkpointCount: checkpoints.length,
-          totalSize: JSON.stringify({ contextItems, fileCache, checkpoints }).length,
-        },
-      };
-
-      if (format === 'json') {
-        const exportPath = path.join(
-          os.tmpdir(),
-          `memory-keeper-export-${targetSessionId.substring(0, 8)}.json`
-        );
-
-        // Check write permissions
-        try {
-          fs.writeFileSync(exportPath, JSON.stringify(exportData, null, 2));
+              },
+            ],
+          };
         } catch (error: any) {
-          if (error.code === 'EACCES') {
-            throw new Error(`Permission denied: Cannot write to ${exportPath}`);
-          }
-          throw error;
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Git commit failed: ${error.message}`,
+              },
+            ],
+          };
+        }
+      }
+
+      // Phase 3: Context Search
+      case 'context_search': {
+        const {
+          query,
+          searchIn = ['key', 'value'],
+          sessionId: specificSessionId,
+          category,
+          channel,
+          channels,
+          sort,
+          limit,
+          offset,
+          createdAfter,
+          createdBefore,
+          keyPattern,
+          priorities,
+          includeMetadata,
+        } = args;
+        const targetSessionId = specificSessionId || currentSessionId || ensureSession();
+
+        // Use enhanced search for all cases
+        const result = repositories.contexts.searchEnhanced({
+          query,
+          sessionId: targetSessionId,
+          searchIn,
+          category,
+          channel,
+          channels,
+          sort,
+          limit,
+          offset,
+          createdAfter,
+          createdBefore,
+          keyPattern,
+          priorities,
+          includeMetadata,
+        });
+
+        if (result.items.length === 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `No results found for: "${query}"`,
+              },
+            ],
+          };
         }
 
-        const stats = {
-          items: contextItems.length,
-          files: fileCache.length,
-          checkpoints: checkpoints.length,
-          size: fs.statSync(exportPath).size,
-        };
+        // Enhanced response format with metadata
+        if (includeMetadata) {
+          const itemsWithMetadata = result.items.map(item => ({
+            key: item.key,
+            value: item.value,
+            category: item.category,
+            priority: item.priority,
+            channel: item.channel,
+            metadata: item.metadata ? JSON.parse(item.metadata) : null,
+            size: item.size || calculateSize(item.value),
+            created_at: item.created_at,
+            updated_at: item.updated_at,
+          }));
+
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(
+                  {
+                    items: itemsWithMetadata,
+                    totalCount: result.totalCount,
+                    page: offset && limit ? Math.floor(offset / limit) + 1 : 1,
+                    pageSize: limit || result.items.length,
+                    query,
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+
+        // Backward compatible format
+        const resultText = result.items
+          .map(
+            (r: any) =>
+              `• [${r.priority}] ${r.key} (${r.category || 'none'})\n  ${r.value.substring(0, 100)}${r.value.length > 100 ? '...' : ''}`
+          )
+          .join('\n\n');
 
         return {
           content: [
             {
               type: 'text',
-              text: includeStats
-                ? `✅ Successfully exported session "${session.name}" to: ${exportPath}
+              text: `Found ${result.items.length} results for "${query}":\n\n${resultText}`,
+            },
+          ],
+        };
+      }
+
+      // Phase 3: Export/Import
+      case 'context_export': {
+        const {
+          sessionId: specificSessionId,
+          format = 'json',
+          includeStats = false,
+          confirmEmpty = false,
+        } = args;
+        const targetSessionId = specificSessionId || currentSessionId;
+
+        // Phase 1: Validation
+        if (!targetSessionId) {
+          throw new Error('No session ID provided and no current session active');
+        }
+
+        // Check if session exists
+        const session = db
+          .prepare('SELECT * FROM sessions WHERE id = ?')
+          .get(targetSessionId) as any;
+        if (!session) {
+          throw new Error(`Session not found: ${targetSessionId}`);
+        }
+
+        // Get session data
+        const contextItems = db
+          .prepare('SELECT * FROM context_items WHERE session_id = ?')
+          .all(targetSessionId);
+        const fileCache = db
+          .prepare('SELECT * FROM file_cache WHERE session_id = ?')
+          .all(targetSessionId);
+        const checkpoints = db
+          .prepare('SELECT * FROM checkpoints WHERE session_id = ?')
+          .all(targetSessionId);
+
+        // Check if session is empty
+        const isEmpty =
+          contextItems.length === 0 && fileCache.length === 0 && checkpoints.length === 0;
+        if (isEmpty && !confirmEmpty) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'Warning: Session appears to be empty. No context items, files, or checkpoints found.\n\nTo export anyway, use confirmEmpty: true',
+              },
+            ],
+            isEmpty: true,
+            requiresConfirmation: true,
+          };
+        }
+
+        const exportData = {
+          version: '0.4.0',
+          exported: new Date().toISOString(),
+          session,
+          contextItems,
+          fileCache,
+          checkpoints,
+          metadata: {
+            itemCount: contextItems.length,
+            fileCount: fileCache.length,
+            checkpointCount: checkpoints.length,
+            totalSize: JSON.stringify({ contextItems, fileCache, checkpoints }).length,
+          },
+        };
+
+        if (format === 'json') {
+          const exportPath = path.join(
+            os.tmpdir(),
+            `memory-keeper-export-${targetSessionId.substring(0, 8)}.json`
+          );
+
+          // Check write permissions
+          try {
+            fs.writeFileSync(exportPath, JSON.stringify(exportData, null, 2));
+          } catch (error: any) {
+            if (error.code === 'EACCES') {
+              throw new Error(`Permission denied: Cannot write to ${exportPath}`);
+            }
+            throw error;
+          }
+
+          const stats = {
+            items: contextItems.length,
+            files: fileCache.length,
+            checkpoints: checkpoints.length,
+            size: fs.statSync(exportPath).size,
+          };
+
+          return {
+            content: [
+              {
+                type: 'text',
+                text: includeStats
+                  ? `✅ Successfully exported session "${session.name}" to: ${exportPath}
 
 📊 Export Statistics:
 - Context Items: ${stats.items}
@@ -1667,283 +1850,283 @@ Checkpoint: ${autoSave ? `git-commit-${new Date().toISOString()}` : 'None'}`,
 - Export Size: ${(stats.size / 1024).toFixed(2)} KB
 
 Session ID: ${targetSessionId}`
-                : `Exported session to: ${exportPath}
+                  : `Exported session to: ${exportPath}
 Items: ${stats.items}
 Files: ${stats.files}`,
+              },
+            ],
+            exportPath,
+            statistics: stats,
+          };
+        }
+
+        // Inline format
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(exportData, null, 2),
             },
           ],
-          exportPath,
-          statistics: stats,
+          statistics: {
+            items: contextItems.length,
+            files: fileCache.length,
+            checkpoints: checkpoints.length,
+          },
         };
       }
 
-      // Inline format
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(exportData, null, 2),
-          },
-        ],
-        statistics: {
-          items: contextItems.length,
-          files: fileCache.length,
-          checkpoints: checkpoints.length,
-        },
-      };
-    }
+      case 'context_import': {
+        const { filePath, merge = false } = args;
 
-    case 'context_import': {
-      const { filePath, merge = false } = args;
+        try {
+          const importData = JSON.parse(fs.readFileSync(filePath, 'utf8'));
 
-      try {
-        const importData = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-
-        // Create new session or merge
-        let targetSessionId: string;
-        if (merge && currentSessionId) {
-          targetSessionId = currentSessionId;
-        } else {
-          targetSessionId = uuidv4();
-          const importedSession = importData.session;
-          db.prepare(
-            `
+          // Create new session or merge
+          let targetSessionId: string;
+          if (merge && currentSessionId) {
+            targetSessionId = currentSessionId;
+          } else {
+            targetSessionId = uuidv4();
+            const importedSession = importData.session;
+            db.prepare(
+              `
             INSERT INTO sessions (id, name, description, branch, working_directory, created_at)
             VALUES (?, ?, ?, ?, ?, ?)
           `
-          ).run(
-            targetSessionId,
-            `Imported: ${importedSession.name}`,
-            `Imported from ${filePath} on ${new Date().toISOString()}`,
-            importedSession.branch,
-            null,
-            new Date().toISOString()
-          );
-          currentSessionId = targetSessionId;
-        }
+            ).run(
+              targetSessionId,
+              `Imported: ${importedSession.name}`,
+              `Imported from ${filePath} on ${new Date().toISOString()}`,
+              importedSession.branch,
+              null,
+              new Date().toISOString()
+            );
+            currentSessionId = targetSessionId;
+          }
 
-        // Import context items
-        const itemStmt = db.prepare(`
+          // Import context items
+          const itemStmt = db.prepare(`
           INSERT OR REPLACE INTO context_items (id, session_id, key, value, category, priority, size, created_at, updated_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))
         `);
 
-        let itemCount = 0;
-        for (const item of importData.contextItems) {
-          itemStmt.run(
-            uuidv4(),
-            targetSessionId,
-            item.key,
-            item.value,
-            item.category,
-            item.priority,
-            item.size || calculateSize(item.value),
-            item.created_at
-          );
-          itemCount++;
-        }
+          let itemCount = 0;
+          for (const item of importData.contextItems) {
+            itemStmt.run(
+              uuidv4(),
+              targetSessionId,
+              item.key,
+              item.value,
+              item.category,
+              item.priority,
+              item.size || calculateSize(item.value),
+              item.created_at
+            );
+            itemCount++;
+          }
 
-        // Import file cache
-        const fileStmt = db.prepare(`
+          // Import file cache
+          const fileStmt = db.prepare(`
           INSERT OR REPLACE INTO file_cache (id, session_id, file_path, content, hash, last_read)
           VALUES (?, ?, ?, ?, ?, ?)
         `);
 
-        let fileCount = 0;
-        for (const file of importData.fileCache || []) {
-          fileStmt.run(
-            uuidv4(),
-            targetSessionId,
-            file.file_path,
-            file.content,
-            file.hash,
-            file.last_read
-          );
-          fileCount++;
-        }
+          let fileCount = 0;
+          for (const file of importData.fileCache || []) {
+            fileStmt.run(
+              uuidv4(),
+              targetSessionId,
+              file.file_path,
+              file.content,
+              file.hash,
+              file.last_read
+            );
+            fileCount++;
+          }
 
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Import successful!
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Import successful!
 Session: ${targetSessionId.substring(0, 8)}
 Context items: ${itemCount}
 Files: ${fileCount}
 Mode: ${merge ? 'Merged' : 'New session'}`,
-            },
-          ],
-        };
-      } catch (error: any) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Import failed: ${error.message}`,
-            },
-          ],
-        };
+              },
+            ],
+          };
+        } catch (error: any) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Import failed: ${error.message}`,
+              },
+            ],
+          };
+        }
       }
-    }
 
-    // Phase 4.1: Knowledge Graph Tools
-    case 'context_analyze': {
-      const { sessionId, categories } = args;
-      const targetSessionId = sessionId || ensureSession();
+      // Phase 4.1: Knowledge Graph Tools
+      case 'context_analyze': {
+        const { sessionId, categories } = args;
+        const targetSessionId = sessionId || ensureSession();
 
-      try {
-        // Get context items to analyze
-        let query = 'SELECT * FROM context_items WHERE session_id = ?';
-        const params: any[] = [targetSessionId];
+        try {
+          // Get context items to analyze
+          let query = 'SELECT * FROM context_items WHERE session_id = ?';
+          const params: any[] = [targetSessionId];
 
-        if (categories && categories.length > 0) {
-          query += ` AND category IN (${categories.map(() => '?').join(',')})`;
-          params.push(...categories);
-        }
-
-        const items = db.prepare(query).all(...params) as any[];
-
-        let entitiesCreated = 0;
-        let relationsCreated = 0;
-
-        // Analyze each context item
-        for (const item of items) {
-          const analysis = knowledgeGraph.analyzeContext(targetSessionId, item.value);
-
-          // Create entities
-          for (const entityData of analysis.entities) {
-            const existing = knowledgeGraph.findEntity(
-              targetSessionId,
-              entityData.name,
-              entityData.type
-            );
-            if (!existing) {
-              knowledgeGraph.createEntity(targetSessionId, entityData.type, entityData.name, {
-                confidence: entityData.confidence,
-                source: item.key,
-              });
-              entitiesCreated++;
-            }
+          if (categories && categories.length > 0) {
+            query += ` AND category IN (${categories.map(() => '?').join(',')})`;
+            params.push(...categories);
           }
 
-          // Create relations
-          for (const relationData of analysis.relations) {
-            const subject = knowledgeGraph.findEntity(targetSessionId, relationData.subject);
-            const object = knowledgeGraph.findEntity(targetSessionId, relationData.object);
+          const items = db.prepare(query).all(...params) as any[];
 
-            if (subject && object) {
-              knowledgeGraph.createRelation(
+          let entitiesCreated = 0;
+          let relationsCreated = 0;
+
+          // Analyze each context item
+          for (const item of items) {
+            const analysis = knowledgeGraph.analyzeContext(targetSessionId, item.value);
+
+            // Create entities
+            for (const entityData of analysis.entities) {
+              const existing = knowledgeGraph.findEntity(
                 targetSessionId,
-                subject.id,
-                relationData.predicate,
-                object.id,
-                relationData.confidence
+                entityData.name,
+                entityData.type
               );
-              relationsCreated++;
+              if (!existing) {
+                knowledgeGraph.createEntity(targetSessionId, entityData.type, entityData.name, {
+                  confidence: entityData.confidence,
+                  source: item.key,
+                });
+                entitiesCreated++;
+              }
+            }
+
+            // Create relations
+            for (const relationData of analysis.relations) {
+              const subject = knowledgeGraph.findEntity(targetSessionId, relationData.subject);
+              const object = knowledgeGraph.findEntity(targetSessionId, relationData.object);
+
+              if (subject && object) {
+                knowledgeGraph.createRelation(
+                  targetSessionId,
+                  subject.id,
+                  relationData.predicate,
+                  object.id,
+                  relationData.confidence
+                );
+                relationsCreated++;
+              }
             }
           }
-        }
 
-        // Get summary statistics
-        const entityStats = db
-          .prepare(
-            `
+          // Get summary statistics
+          const entityStats = db
+            .prepare(
+              `
           SELECT type, COUNT(*) as count 
           FROM entities 
           WHERE session_id = ? 
           GROUP BY type
         `
-          )
-          .all(targetSessionId) as any[];
+            )
+            .all(targetSessionId) as any[];
 
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Analysis complete!
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Analysis complete!
 Items analyzed: ${items.length}
 Entities created: ${entitiesCreated}
 Relations created: ${relationsCreated}
 
 Entity breakdown:
 ${entityStats.map(s => `- ${s.type}: ${s.count}`).join('\n')}`,
-            },
-          ],
-        };
-      } catch (error: any) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Analysis failed: ${error.message}`,
-            },
-          ],
-        };
-      }
-    }
-
-    case 'context_find_related': {
-      const { key, relationTypes, maxDepth = 2 } = args;
-      const sessionId = ensureSession();
-
-      try {
-        // First try to find as entity
-        let entity = knowledgeGraph.findEntity(sessionId, key);
-
-        // If not found as entity, check if it's a context key
-        if (!entity) {
-          const contextItem = db
-            .prepare('SELECT * FROM context_items WHERE session_id = ? AND key = ?')
-            .get(sessionId, key) as any;
-
-          if (contextItem) {
-            // Try to extract entities from the context value
-            const analysis = knowledgeGraph.analyzeContext(sessionId, contextItem.value);
-            if (analysis.entities.length > 0) {
-              entity = knowledgeGraph.findEntity(sessionId, analysis.entities[0].name);
-            }
-          }
-        }
-
-        if (!entity) {
+              },
+            ],
+          };
+        } catch (error: any) {
           return {
             content: [
               {
                 type: 'text',
-                text: `No entity found for key: ${key}`,
+                text: `Analysis failed: ${error.message}`,
               },
             ],
           };
         }
+      }
 
-        // Get connected entities
-        const connectedIds = knowledgeGraph.getConnectedEntities(entity.id, maxDepth);
+      case 'context_find_related': {
+        const { key, relationTypes, maxDepth = 2 } = args;
+        const sessionId = ensureSession();
 
-        // Get details for connected entities
-        const entities = Array.from(connectedIds).map(id => {
-          const entityData = db.prepare('SELECT * FROM entities WHERE id = ?').get(id) as any;
-          const relations = knowledgeGraph.getRelations(id);
-          const observations = knowledgeGraph.getObservations(id);
+        try {
+          // First try to find as entity
+          let entity = knowledgeGraph.findEntity(sessionId, key);
+
+          // If not found as entity, check if it's a context key
+          if (!entity) {
+            const contextItem = db
+              .prepare('SELECT * FROM context_items WHERE session_id = ? AND key = ?')
+              .get(sessionId, key) as any;
+
+            if (contextItem) {
+              // Try to extract entities from the context value
+              const analysis = knowledgeGraph.analyzeContext(sessionId, contextItem.value);
+              if (analysis.entities.length > 0) {
+                entity = knowledgeGraph.findEntity(sessionId, analysis.entities[0].name);
+              }
+            }
+          }
+
+          if (!entity) {
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: `No entity found for key: ${key}`,
+                },
+              ],
+            };
+          }
+
+          // Get connected entities
+          const connectedIds = knowledgeGraph.getConnectedEntities(entity.id, maxDepth);
+
+          // Get details for connected entities
+          const entities = Array.from(connectedIds).map(id => {
+            const entityData = db.prepare('SELECT * FROM entities WHERE id = ?').get(id) as any;
+            const relations = knowledgeGraph.getRelations(id);
+            const observations = knowledgeGraph.getObservations(id);
+
+            return {
+              ...entityData,
+              attributes: entityData.attributes ? JSON.parse(entityData.attributes) : {},
+              relations: relations.length,
+              observations: observations.length,
+            };
+          });
+
+          // Filter by relation types if specified
+          let relevantRelations = knowledgeGraph.getRelations(entity.id);
+          if (relationTypes && relationTypes.length > 0) {
+            relevantRelations = relevantRelations.filter(r => relationTypes.includes(r.predicate));
+          }
 
           return {
-            ...entityData,
-            attributes: entityData.attributes ? JSON.parse(entityData.attributes) : {},
-            relations: relations.length,
-            observations: observations.length,
-          };
-        });
-
-        // Filter by relation types if specified
-        let relevantRelations = knowledgeGraph.getRelations(entity.id);
-        if (relationTypes && relationTypes.length > 0) {
-          relevantRelations = relevantRelations.filter(r => relationTypes.includes(r.predicate));
-        }
-
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Related entities for "${key}":
+            content: [
+              {
+                type: 'text',
+                text: `Related entities for "${key}":
 
 Found ${entities.length} connected entities (max depth: ${maxDepth})
 
@@ -1958,42 +2141,42 @@ ${entities
   .map(e => `- ${e.type}: ${e.name} (${e.relations} relations, ${e.observations} observations)`)
   .join('\n')}
 ${entities.length > 20 ? `\n... and ${entities.length - 20} more` : ''}`,
-            },
-          ],
-        };
-      } catch (error: any) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Find related failed: ${error.message}`,
-            },
-          ],
-        };
-      }
-    }
-
-    case 'context_visualize': {
-      const { type = 'graph', entityTypes, sessionId } = args;
-      const targetSessionId = sessionId || ensureSession();
-
-      try {
-        if (type === 'graph') {
-          const graphData = knowledgeGraph.getGraphData(targetSessionId, entityTypes);
-
+              },
+            ],
+          };
+        } catch (error: any) {
           return {
             content: [
               {
                 type: 'text',
-                text: JSON.stringify(graphData, null, 2),
+                text: `Find related failed: ${error.message}`,
               },
             ],
           };
-        } else if (type === 'timeline') {
-          // Get time-based data
-          const timeline = db
-            .prepare(
-              `
+        }
+      }
+
+      case 'context_visualize': {
+        const { type = 'graph', entityTypes, sessionId } = args;
+        const targetSessionId = sessionId || ensureSession();
+
+        try {
+          if (type === 'graph') {
+            const graphData = knowledgeGraph.getGraphData(targetSessionId, entityTypes);
+
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify(graphData, null, 2),
+                },
+              ],
+            };
+          } else if (type === 'timeline') {
+            // Get time-based data
+            const timeline = db
+              .prepare(
+                `
             SELECT 
               strftime('%Y-%m-%d %H:00', created_at) as hour,
               COUNT(*) as events,
@@ -2004,29 +2187,29 @@ ${entities.length > 20 ? `\n... and ${entities.length - 20} more` : ''}`,
             ORDER BY hour DESC
             LIMIT 24
           `
-            )
-            .all(targetSessionId) as any[];
+              )
+              .all(targetSessionId) as any[];
 
-          return {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify(
-                  {
-                    type: 'timeline',
-                    data: timeline,
-                  },
-                  null,
-                  2
-                ),
-              },
-            ],
-          };
-        } else if (type === 'heatmap') {
-          // Get category/priority heatmap data
-          const heatmap = db
-            .prepare(
-              `
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify(
+                    {
+                      type: 'timeline',
+                      data: timeline,
+                    },
+                    null,
+                    2
+                  ),
+                },
+              ],
+            };
+          } else if (type === 'heatmap') {
+            // Get category/priority heatmap data
+            const heatmap = db
+              .prepare(
+                `
             SELECT 
               category,
               priority,
@@ -2035,701 +2218,703 @@ ${entities.length > 20 ? `\n... and ${entities.length - 20} more` : ''}`,
             WHERE session_id = ?
             GROUP BY category, priority
           `
-            )
-            .all(targetSessionId) as any[];
+              )
+              .all(targetSessionId) as any[];
 
-          return {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify(
-                  {
-                    type: 'heatmap',
-                    data: heatmap,
-                  },
-                  null,
-                  2
-                ),
-              },
-            ],
-          };
-        }
-
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Unknown visualization type: ${type}`,
-            },
-          ],
-        };
-      } catch (error: any) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Visualization failed: ${error.message}`,
-            },
-          ],
-        };
-      }
-    }
-
-    // Phase 4.2: Semantic Search
-    case 'context_semantic_search': {
-      const { query, topK = 10, minSimilarity = 0.3, sessionId } = args;
-      const targetSessionId = sessionId || ensureSession();
-
-      try {
-        // Ensure embeddings are up to date for the session
-        const _embeddingCount = await vectorStore.updateSessionEmbeddings(targetSessionId);
-
-        // Perform semantic search
-        const results = await vectorStore.searchInSession(
-          targetSessionId,
-          query,
-          topK,
-          minSimilarity
-        );
-
-        if (results.length === 0) {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: `No results found for query: "${query}"`,
-              },
-            ],
-          };
-        }
-
-        // Format results
-        let response = `Found ${results.length} results for: "${query}"\n\n`;
-
-        results.forEach((result, index) => {
-          const similarity = (result.similarity * 100).toFixed(1);
-          response += `${index + 1}. [${similarity}% match]\n`;
-
-          // Extract key and value from content
-          const colonIndex = result.content.indexOf(':');
-          if (colonIndex > -1) {
-            const key = result.content.substring(0, colonIndex);
-            const value = result.content.substring(colonIndex + 1).trim();
-            response += `   Key: ${key}\n`;
-            response += `   Value: ${value.substring(0, 200)}${value.length > 200 ? '...' : ''}\n`;
-          } else {
-            response += `   ${result.content.substring(0, 200)}${result.content.length > 200 ? '...' : ''}\n`;
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify(
+                    {
+                      type: 'heatmap',
+                      data: heatmap,
+                    },
+                    null,
+                    2
+                  ),
+                },
+              ],
+            };
           }
 
-          if (result.metadata) {
-            if (result.metadata.category) {
-              response += `   Category: ${result.metadata.category}`;
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Unknown visualization type: ${type}`,
+              },
+            ],
+          };
+        } catch (error: any) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Visualization failed: ${error.message}`,
+              },
+            ],
+          };
+        }
+      }
+
+      // Phase 4.2: Semantic Search
+      case 'context_semantic_search': {
+        const { query, topK = 10, minSimilarity = 0.3, sessionId } = args;
+        const targetSessionId = sessionId || ensureSession();
+
+        try {
+          // Ensure embeddings are up to date for the session
+          const _embeddingCount = await vectorStore.updateSessionEmbeddings(targetSessionId);
+
+          // Perform semantic search
+          const results = await vectorStore.searchInSession(
+            targetSessionId,
+            query,
+            topK,
+            minSimilarity
+          );
+
+          if (results.length === 0) {
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: `No results found for query: "${query}"`,
+                },
+              ],
+            };
+          }
+
+          // Format results
+          let response = `Found ${results.length} results for: "${query}"\n\n`;
+
+          results.forEach((result, index) => {
+            const similarity = (result.similarity * 100).toFixed(1);
+            response += `${index + 1}. [${similarity}% match]\n`;
+
+            // Extract key and value from content
+            const colonIndex = result.content.indexOf(':');
+            if (colonIndex > -1) {
+              const key = result.content.substring(0, colonIndex);
+              const value = result.content.substring(colonIndex + 1).trim();
+              response += `   Key: ${key}\n`;
+              response += `   Value: ${value.substring(0, 200)}${value.length > 200 ? '...' : ''}\n`;
+            } else {
+              response += `   ${result.content.substring(0, 200)}${result.content.length > 200 ? '...' : ''}\n`;
             }
-            if (result.metadata.priority) {
-              response += `, Priority: ${result.metadata.priority}`;
+
+            if (result.metadata) {
+              if (result.metadata.category) {
+                response += `   Category: ${result.metadata.category}`;
+              }
+              if (result.metadata.priority) {
+                response += `, Priority: ${result.metadata.priority}`;
+              }
+              response += '\n';
             }
             response += '\n';
-          }
-          response += '\n';
-        });
+          });
 
-        return {
-          content: [
-            {
-              type: 'text',
-              text: response,
-            },
-          ],
-        };
-      } catch (error: any) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Semantic search failed: ${error.message}`,
-            },
-          ],
-        };
+          return {
+            content: [
+              {
+                type: 'text',
+                text: response,
+              },
+            ],
+          };
+        } catch (error: any) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Semantic search failed: ${error.message}`,
+              },
+            ],
+          };
+        }
       }
-    }
 
-    // Phase 4.3: Multi-Agent System
-    case 'context_delegate': {
-      const { taskType, input, sessionId, chain = false } = args;
-      const targetSessionId = sessionId || ensureSession();
+      // Phase 4.3: Multi-Agent System
+      case 'context_delegate': {
+        const { taskType, input, sessionId, chain = false } = args;
+        const targetSessionId = sessionId || ensureSession();
 
-      try {
-        // Create agent task
-        const task: AgentTask = {
-          id: uuidv4(),
-          type: taskType,
-          input: {
-            ...input,
-            sessionId: targetSessionId,
-          },
-        };
-
-        // Process with agents
-        let results;
-        if (chain && Array.isArray(input)) {
-          // Process as a chain of tasks
-          const tasks = input.map((inp, index) => ({
+        try {
+          // Create agent task
+          const task: AgentTask = {
             id: uuidv4(),
-            type: Array.isArray(taskType) ? taskType[index] : taskType,
-            input: { ...inp, sessionId: targetSessionId },
-          }));
-          results = await agentCoordinator.processChain(tasks);
-        } else {
-          // Single task delegation
-          results = await agentCoordinator.delegate(task);
-        }
+            type: taskType,
+            input: {
+              ...input,
+              sessionId: targetSessionId,
+            },
+          };
 
-        // Format response
-        let response = `Agent Processing Results:\n\n`;
-
-        for (const result of results) {
-          response += `## ${result.agentType.toUpperCase()} Agent\n`;
-          response += `Confidence: ${(result.confidence * 100).toFixed(0)}%\n`;
-          response += `Processing Time: ${result.processingTime}ms\n`;
-
-          if (result.reasoning) {
-            response += `Reasoning: ${result.reasoning}\n`;
+          // Process with agents
+          let results;
+          if (chain && Array.isArray(input)) {
+            // Process as a chain of tasks
+            const tasks = input.map((inp, index) => ({
+              id: uuidv4(),
+              type: Array.isArray(taskType) ? taskType[index] : taskType,
+              input: { ...inp, sessionId: targetSessionId },
+            }));
+            results = await agentCoordinator.processChain(tasks);
+          } else {
+            // Single task delegation
+            results = await agentCoordinator.delegate(task);
           }
 
-          response += `\nOutput:\n`;
-          response += JSON.stringify(result.output, null, 2);
-          response += '\n\n---\n\n';
-        }
+          // Format response
+          let response = `Agent Processing Results:\n\n`;
 
-        // Get best result if multiple agents processed
-        if (results.length > 1) {
-          const best = agentCoordinator.getBestResult(task.id);
-          if (best) {
-            response += `\n## Best Result (${best.agentType}, ${(best.confidence * 100).toFixed(0)}% confidence):\n`;
-            response += JSON.stringify(best.output, null, 2);
+          for (const result of results) {
+            response += `## ${result.agentType.toUpperCase()} Agent\n`;
+            response += `Confidence: ${(result.confidence * 100).toFixed(0)}%\n`;
+            response += `Processing Time: ${result.processingTime}ms\n`;
+
+            if (result.reasoning) {
+              response += `Reasoning: ${result.reasoning}\n`;
+            }
+
+            response += `\nOutput:\n`;
+            response += JSON.stringify(result.output, null, 2);
+            response += '\n\n---\n\n';
           }
-        }
 
-        return {
-          content: [
-            {
-              type: 'text',
-              text: response,
-            },
-          ],
-        };
-      } catch (error: any) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Agent delegation failed: ${error.message}`,
-            },
-          ],
-        };
+          // Get best result if multiple agents processed
+          if (results.length > 1) {
+            const best = agentCoordinator.getBestResult(task.id);
+            if (best) {
+              response += `\n## Best Result (${best.agentType}, ${(best.confidence * 100).toFixed(0)}% confidence):\n`;
+              response += JSON.stringify(best.output, null, 2);
+            }
+          }
+
+          return {
+            content: [
+              {
+                type: 'text',
+                text: response,
+              },
+            ],
+          };
+        } catch (error: any) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Agent delegation failed: ${error.message}`,
+              },
+            ],
+          };
+        }
       }
-    }
 
-    // Phase 4.4: Session Branching
-    case 'context_branch_session': {
-      const { branchName, copyDepth = 'shallow' } = args;
-      const sourceSessionId = ensureSession();
+      // Phase 4.4: Session Branching
+      case 'context_branch_session': {
+        const { branchName, copyDepth = 'shallow' } = args;
+        const sourceSessionId = ensureSession();
 
-      try {
-        // Get source session info
-        const sourceSession = db
-          .prepare('SELECT * FROM sessions WHERE id = ?')
-          .get(sourceSessionId) as any;
-        if (!sourceSession) {
-          throw new Error('Source session not found');
-        }
+        try {
+          // Get source session info
+          const sourceSession = db
+            .prepare('SELECT * FROM sessions WHERE id = ?')
+            .get(sourceSessionId) as any;
+          if (!sourceSession) {
+            throw new Error('Source session not found');
+          }
 
-        // Create new branch session
-        const branchId = uuidv4();
-        db.prepare(
-          `
+          // Create new branch session
+          const branchId = uuidv4();
+          db.prepare(
+            `
           INSERT INTO sessions (id, name, description, branch, working_directory, parent_id)
           VALUES (?, ?, ?, ?, ?, ?)
         `
-        ).run(
-          branchId,
-          branchName,
-          `Branch of ${sourceSession.name} created at ${new Date().toISOString()}`,
-          sourceSession.branch,
-          null,
-          sourceSessionId
-        );
-
-        if (copyDepth === 'deep') {
-          // Copy all context items
-          const items = db
-            .prepare('SELECT * FROM context_items WHERE session_id = ?')
-            .all(sourceSessionId) as any[];
-          const stmt = db.prepare(
-            'INSERT INTO context_items (id, session_id, key, value, category, priority, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+          ).run(
+            branchId,
+            branchName,
+            `Branch of ${sourceSession.name} created at ${new Date().toISOString()}`,
+            sourceSession.branch,
+            null,
+            sourceSessionId
           );
 
-          for (const item of items) {
-            stmt.run(
-              uuidv4(),
-              branchId,
-              item.key,
-              item.value,
-              item.category,
-              item.priority,
-              item.created_at
+          if (copyDepth === 'deep') {
+            // Copy all context items
+            const items = db
+              .prepare('SELECT * FROM context_items WHERE session_id = ?')
+              .all(sourceSessionId) as any[];
+            const stmt = db.prepare(
+              'INSERT INTO context_items (id, session_id, key, value, category, priority, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
             );
+
+            for (const item of items) {
+              stmt.run(
+                uuidv4(),
+                branchId,
+                item.key,
+                item.value,
+                item.category,
+                item.priority,
+                item.created_at
+              );
+            }
+
+            // Copy file cache
+            const files = db
+              .prepare('SELECT * FROM file_cache WHERE session_id = ?')
+              .all(sourceSessionId) as any[];
+            const fileStmt = db.prepare(
+              'INSERT INTO file_cache (id, session_id, file_path, content, hash, last_read) VALUES (?, ?, ?, ?, ?, ?)'
+            );
+
+            for (const file of files) {
+              fileStmt.run(
+                uuidv4(),
+                branchId,
+                file.file_path,
+                file.content,
+                file.hash,
+                file.last_read
+              );
+            }
+          } else {
+            // Shallow copy - only copy high priority items
+            const items = db
+              .prepare('SELECT * FROM context_items WHERE session_id = ? AND priority = ?')
+              .all(sourceSessionId, 'high') as any[];
+            const stmt = db.prepare(
+              'INSERT INTO context_items (id, session_id, key, value, category, priority, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+            );
+
+            for (const item of items) {
+              stmt.run(
+                uuidv4(),
+                branchId,
+                item.key,
+                item.value,
+                item.category,
+                item.priority,
+                item.created_at
+              );
+            }
           }
 
-          // Copy file cache
-          const files = db
-            .prepare('SELECT * FROM file_cache WHERE session_id = ?')
-            .all(sourceSessionId) as any[];
-          const fileStmt = db.prepare(
-            'INSERT INTO file_cache (id, session_id, file_path, content, hash, last_read) VALUES (?, ?, ?, ?, ?, ?)'
-          );
+          // Switch to the new branch
+          currentSessionId = branchId;
 
-          for (const file of files) {
-            fileStmt.run(
-              uuidv4(),
-              branchId,
-              file.file_path,
-              file.content,
-              file.hash,
-              file.last_read
-            );
-          }
-        } else {
-          // Shallow copy - only copy high priority items
-          const items = db
-            .prepare('SELECT * FROM context_items WHERE session_id = ? AND priority = ?')
-            .all(sourceSessionId, 'high') as any[];
-          const stmt = db.prepare(
-            'INSERT INTO context_items (id, session_id, key, value, category, priority, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-          );
-
-          for (const item of items) {
-            stmt.run(
-              uuidv4(),
-              branchId,
-              item.key,
-              item.value,
-              item.category,
-              item.priority,
-              item.created_at
-            );
-          }
-        }
-
-        // Switch to the new branch
-        currentSessionId = branchId;
-
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Created branch session: ${branchName}
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Created branch session: ${branchName}
 ID: ${branchId}
 Parent: ${sourceSession.name} (${sourceSessionId.substring(0, 8)})
 Copy depth: ${copyDepth}
 Items copied: ${copyDepth === 'deep' ? 'All' : 'High priority only'}
 
 Now working in branch: ${branchName}`,
-            },
-          ],
-        };
-      } catch (error: any) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Branch creation failed: ${error.message}`,
-            },
-          ],
-        };
+              },
+            ],
+          };
+        } catch (error: any) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Branch creation failed: ${error.message}`,
+              },
+            ],
+          };
+        }
       }
-    }
 
-    // Phase 4.4: Session Merging
-    case 'context_merge_sessions': {
-      const { sourceSessionId, conflictResolution = 'keep_current' } = args;
-      const targetSessionId = ensureSession();
+      // Phase 4.4: Session Merging
+      case 'context_merge_sessions': {
+        const { sourceSessionId, conflictResolution = 'keep_current' } = args;
+        const targetSessionId = ensureSession();
 
-      try {
-        // Get both sessions
-        const sourceSession = db
-          .prepare('SELECT * FROM sessions WHERE id = ?')
-          .get(sourceSessionId) as any;
-        const targetSession = db
-          .prepare('SELECT * FROM sessions WHERE id = ?')
-          .get(targetSessionId) as any;
+        try {
+          // Get both sessions
+          const sourceSession = db
+            .prepare('SELECT * FROM sessions WHERE id = ?')
+            .get(sourceSessionId) as any;
+          const targetSession = db
+            .prepare('SELECT * FROM sessions WHERE id = ?')
+            .get(targetSessionId) as any;
 
-        if (!sourceSession) {
-          throw new Error('Source session not found');
-        }
-
-        // Get items from source session
-        const sourceItems = db
-          .prepare('SELECT * FROM context_items WHERE session_id = ?')
-          .all(sourceSessionId) as any[];
-
-        let merged = 0;
-        let skipped = 0;
-
-        for (const item of sourceItems) {
-          // Check if item exists in target
-          const existing = db
-            .prepare('SELECT * FROM context_items WHERE session_id = ? AND key = ?')
-            .get(targetSessionId, item.key) as any;
-
-          if (existing) {
-            // Handle conflict
-            if (
-              conflictResolution === 'keep_source' ||
-              (conflictResolution === 'keep_newest' &&
-                new Date(item.created_at) > new Date(existing.created_at))
-            ) {
-              db.prepare(
-                'UPDATE context_items SET value = ?, category = ?, priority = ? WHERE session_id = ? AND key = ?'
-              ).run(item.value, item.category, item.priority, targetSessionId, item.key);
-              merged++;
-            } else {
-              skipped++;
-            }
-          } else {
-            // No conflict, insert item
-            db.prepare(
-              'INSERT INTO context_items (id, session_id, key, value, category, priority, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-            ).run(
-              uuidv4(),
-              targetSessionId,
-              item.key,
-              item.value,
-              item.category,
-              item.priority,
-              item.created_at
-            );
-            merged++;
+          if (!sourceSession) {
+            throw new Error('Source session not found');
           }
-        }
 
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Merge completed!
+          // Get items from source session
+          const sourceItems = db
+            .prepare('SELECT * FROM context_items WHERE session_id = ?')
+            .all(sourceSessionId) as any[];
+
+          let merged = 0;
+          let skipped = 0;
+
+          for (const item of sourceItems) {
+            // Check if item exists in target
+            const existing = db
+              .prepare('SELECT * FROM context_items WHERE session_id = ? AND key = ?')
+              .get(targetSessionId, item.key) as any;
+
+            if (existing) {
+              // Handle conflict
+              if (
+                conflictResolution === 'keep_source' ||
+                (conflictResolution === 'keep_newest' &&
+                  new Date(item.created_at) > new Date(existing.created_at))
+              ) {
+                db.prepare(
+                  'UPDATE context_items SET value = ?, category = ?, priority = ? WHERE session_id = ? AND key = ?'
+                ).run(item.value, item.category, item.priority, targetSessionId, item.key);
+                merged++;
+              } else {
+                skipped++;
+              }
+            } else {
+              // No conflict, insert item
+              db.prepare(
+                'INSERT INTO context_items (id, session_id, key, value, category, priority, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+              ).run(
+                uuidv4(),
+                targetSessionId,
+                item.key,
+                item.value,
+                item.category,
+                item.priority,
+                item.created_at
+              );
+              merged++;
+            }
+          }
+
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Merge completed!
 Source: ${sourceSession.name} (${sourceSessionId.substring(0, 8)})
 Target: ${targetSession.name} (${targetSessionId.substring(0, 8)})
 Items merged: ${merged}
 Items skipped: ${skipped}
 Conflict resolution: ${conflictResolution}`,
-            },
-          ],
-        };
-      } catch (error: any) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Session merge failed: ${error.message}`,
-            },
-          ],
-        };
-      }
-    }
-
-    // Phase 4.4: Journal Entry
-    case 'context_journal_entry': {
-      const { entry, tags = [], mood } = args;
-      const sessionId = ensureSession();
-
-      try {
-        const id = uuidv4();
-        db.prepare(
-          `
-          INSERT INTO journal_entries (id, session_id, entry, tags, mood)
-          VALUES (?, ?, ?, ?, ?)
-        `
-        ).run(id, sessionId, entry, JSON.stringify(tags), mood);
-
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Journal entry added!
-Time: ${new Date().toISOString()}
-Mood: ${mood || 'not specified'}
-Tags: ${tags.join(', ') || 'none'}
-Entry saved with ID: ${id.substring(0, 8)}`,
-            },
-          ],
-        };
-      } catch (error: any) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Journal entry failed: ${error.message}`,
-            },
-          ],
-        };
-      }
-    }
-
-    // Phase 4.4: Timeline
-    case 'context_timeline': {
-      const {
-        startDate,
-        endDate,
-        groupBy = 'day',
-        sessionId,
-        categories,
-        relativeTime,
-        itemsPerPeriod,
-        includeItems,
-        minItemsPerPeriod,
-        showEmpty,
-      } = args;
-      const targetSessionId = sessionId || ensureSession();
-
-      try {
-        // Use the enhanced timeline method
-        const timeline = repositories.contexts.getTimelineData({
-          sessionId: targetSessionId,
-          startDate,
-          endDate,
-          categories,
-          relativeTime,
-          itemsPerPeriod,
-          includeItems,
-          groupBy,
-          minItemsPerPeriod,
-          showEmpty,
-        });
-
-        // Get journal entries for the same period
-        let journalQuery = 'SELECT * FROM journal_entries WHERE session_id = ?';
-        const journalParams: any[] = [targetSessionId];
-
-        // Calculate effective dates based on relativeTime if needed
-        let effectiveStartDate = startDate;
-        let effectiveEndDate = endDate;
-
-        if (relativeTime) {
-          const now = new Date();
-          const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-
-          if (relativeTime === 'today') {
-            effectiveStartDate = today.toISOString();
-            effectiveEndDate = new Date(today.getTime() + 24 * 60 * 60 * 1000).toISOString();
-          } else if (relativeTime === 'yesterday') {
-            const yesterday = new Date(today.getTime() - 24 * 60 * 60 * 1000);
-            effectiveStartDate = yesterday.toISOString();
-            effectiveEndDate = today.toISOString();
-          } else if (relativeTime.match(/^(\d+) hours? ago$/)) {
-            const hours = parseInt(relativeTime.match(/^(\d+)/)![1]);
-            effectiveStartDate = new Date(now.getTime() - hours * 60 * 60 * 1000).toISOString();
-          } else if (relativeTime.match(/^(\d+) days? ago$/)) {
-            const days = parseInt(relativeTime.match(/^(\d+)/)![1]);
-            effectiveStartDate = new Date(now.getTime() - days * 24 * 60 * 60 * 1000).toISOString();
-          } else if (relativeTime === 'this week') {
-            const startOfWeek = new Date(today);
-            startOfWeek.setDate(today.getDate() - today.getDay());
-            effectiveStartDate = startOfWeek.toISOString();
-          } else if (relativeTime === 'last week') {
-            const startOfLastWeek = new Date(today);
-            startOfLastWeek.setDate(today.getDate() - today.getDay() - 7);
-            const endOfLastWeek = new Date(startOfLastWeek);
-            endOfLastWeek.setDate(startOfLastWeek.getDate() + 7);
-            effectiveStartDate = startOfLastWeek.toISOString();
-            effectiveEndDate = endOfLastWeek.toISOString();
-          }
-        }
-
-        if (effectiveStartDate) {
-          journalQuery += ' AND created_at >= ?';
-          journalParams.push(effectiveStartDate);
-        }
-        if (effectiveEndDate) {
-          journalQuery += ' AND created_at <= ?';
-          journalParams.push(effectiveEndDate);
-        }
-
-        const journals = db
-          .prepare(journalQuery + ' ORDER BY created_at')
-          .all(...journalParams) as any[];
-
-        // Format enhanced timeline response
-        const timelineData = {
-          session_id: targetSessionId,
-          period: {
-            start: effectiveStartDate || startDate || 'beginning',
-            end: effectiveEndDate || endDate || 'now',
-            relative: relativeTime || null,
-          },
-          groupBy,
-          filters: {
-            categories: categories || null,
-          },
-          timeline: timeline.map(period => {
-            const result: any = {
-              period: period.period,
-              count: period.count,
-            };
-
-            if (includeItems && period.items) {
-              result.items = period.items.map((item: any) => ({
-                key: item.key,
-                value: item.value,
-                category: item.category,
-                priority: item.priority,
-                created_at: item.created_at,
-              }));
-
-              if (period.hasMore) {
-                result.hasMore = true;
-                result.totalCount = period.totalCount;
-              }
-            }
-
-            return result;
-          }),
-          journal_entries: journals.map((journal: any) => ({
-            entry: journal.entry,
-            tags: JSON.parse(journal.tags || '[]'),
-            mood: journal.mood,
-            created_at: journal.created_at,
-          })),
-        };
-
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(timelineData, null, 2),
-            },
-          ],
-        };
-      } catch (error: any) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Timeline generation failed: ${error.message}`,
-            },
-          ],
-        };
-      }
-    }
-
-    // Phase 4.4: Progressive Compression
-    case 'context_compress': {
-      const { olderThan, preserveCategories = [], targetSize: _targetSize, sessionId } = args;
-      const targetSessionId = sessionId || ensureSession();
-
-      try {
-        // Build query for items to compress
-        let query = 'SELECT * FROM context_items WHERE session_id = ?';
-        const params: any[] = [targetSessionId];
-
-        if (olderThan) {
-          query += ' AND created_at < ?';
-          params.push(olderThan);
-        }
-
-        if (preserveCategories.length > 0) {
-          query += ` AND category NOT IN (${preserveCategories.map(() => '?').join(',')})`;
-          params.push(...preserveCategories);
-        }
-
-        const itemsToCompress = db.prepare(query).all(...params) as any[];
-
-        if (itemsToCompress.length === 0) {
+              },
+            ],
+          };
+        } catch (error: any) {
           return {
             content: [
               {
                 type: 'text',
-                text: 'No items found to compress with given criteria.',
+                text: `Session merge failed: ${error.message}`,
               },
             ],
           };
         }
+      }
 
-        // Group items by category for compression
-        const categoryGroups: Record<string, any[]> = {};
-        for (const item of itemsToCompress) {
-          const category = item.category || 'uncategorized';
-          if (!categoryGroups[category]) {
-            categoryGroups[category] = [];
-          }
-          categoryGroups[category].push(item);
+      // Phase 4.4: Journal Entry
+      case 'context_journal_entry': {
+        const { entry, tags = [], mood } = args;
+        const sessionId = ensureSession();
+
+        try {
+          const id = uuidv4();
+          db.prepare(
+            `
+          INSERT INTO journal_entries (id, session_id, entry, tags, mood)
+          VALUES (?, ?, ?, ?, ?)
+        `
+          ).run(id, sessionId, entry, JSON.stringify(tags), mood);
+
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Journal entry added!
+Time: ${new Date().toISOString()}
+Mood: ${mood || 'not specified'}
+Tags: ${tags.join(', ') || 'none'}
+Entry saved with ID: ${id.substring(0, 8)}`,
+              },
+            ],
+          };
+        } catch (error: any) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Journal entry failed: ${error.message}`,
+              },
+            ],
+          };
         }
+      }
 
-        // Compress each category group
-        const compressed: any[] = [];
-        for (const [category, items] of Object.entries(categoryGroups)) {
-          const summary = {
-            category,
-            count: items.length,
-            priorities: { high: 0, normal: 0, low: 0 },
-            keys: items.map((i: any) => i.key),
-            samples: items
-              .slice(0, 3)
-              .map((i: any) => ({ key: i.key, value: i.value.substring(0, 100) })),
+      // Phase 4.4: Timeline
+      case 'context_timeline': {
+        const {
+          startDate,
+          endDate,
+          groupBy = 'day',
+          sessionId,
+          categories,
+          relativeTime,
+          itemsPerPeriod,
+          includeItems,
+          minItemsPerPeriod,
+          showEmpty,
+        } = args;
+        const targetSessionId = sessionId || ensureSession();
+
+        try {
+          // Use the enhanced timeline method
+          const timeline = repositories.contexts.getTimelineData({
+            sessionId: targetSessionId,
+            startDate,
+            endDate,
+            categories,
+            relativeTime,
+            itemsPerPeriod,
+            includeItems,
+            groupBy,
+            minItemsPerPeriod,
+            showEmpty,
+          });
+
+          // Get journal entries for the same period
+          let journalQuery = 'SELECT * FROM journal_entries WHERE session_id = ?';
+          const journalParams: any[] = [targetSessionId];
+
+          // Calculate effective dates based on relativeTime if needed
+          let effectiveStartDate = startDate;
+          let effectiveEndDate = endDate;
+
+          if (relativeTime) {
+            const now = new Date();
+            const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+            if (relativeTime === 'today') {
+              effectiveStartDate = today.toISOString();
+              effectiveEndDate = new Date(today.getTime() + 24 * 60 * 60 * 1000).toISOString();
+            } else if (relativeTime === 'yesterday') {
+              const yesterday = new Date(today.getTime() - 24 * 60 * 60 * 1000);
+              effectiveStartDate = yesterday.toISOString();
+              effectiveEndDate = today.toISOString();
+            } else if (relativeTime.match(/^(\d+) hours? ago$/)) {
+              const hours = parseInt(relativeTime.match(/^(\d+)/)![1]);
+              effectiveStartDate = new Date(now.getTime() - hours * 60 * 60 * 1000).toISOString();
+            } else if (relativeTime.match(/^(\d+) days? ago$/)) {
+              const days = parseInt(relativeTime.match(/^(\d+)/)![1]);
+              effectiveStartDate = new Date(
+                now.getTime() - days * 24 * 60 * 60 * 1000
+              ).toISOString();
+            } else if (relativeTime === 'this week') {
+              const startOfWeek = new Date(today);
+              startOfWeek.setDate(today.getDate() - today.getDay());
+              effectiveStartDate = startOfWeek.toISOString();
+            } else if (relativeTime === 'last week') {
+              const startOfLastWeek = new Date(today);
+              startOfLastWeek.setDate(today.getDate() - today.getDay() - 7);
+              const endOfLastWeek = new Date(startOfLastWeek);
+              endOfLastWeek.setDate(startOfLastWeek.getDate() + 7);
+              effectiveStartDate = startOfLastWeek.toISOString();
+              effectiveEndDate = endOfLastWeek.toISOString();
+            }
+          }
+
+          if (effectiveStartDate) {
+            journalQuery += ' AND created_at >= ?';
+            journalParams.push(effectiveStartDate);
+          }
+          if (effectiveEndDate) {
+            journalQuery += ' AND created_at <= ?';
+            journalParams.push(effectiveEndDate);
+          }
+
+          const journals = db
+            .prepare(journalQuery + ' ORDER BY created_at')
+            .all(...journalParams) as any[];
+
+          // Format enhanced timeline response
+          const timelineData = {
+            session_id: targetSessionId,
+            period: {
+              start: effectiveStartDate || startDate || 'beginning',
+              end: effectiveEndDate || endDate || 'now',
+              relative: relativeTime || null,
+            },
+            groupBy,
+            filters: {
+              categories: categories || null,
+            },
+            timeline: timeline.map(period => {
+              const result: any = {
+                period: period.period,
+                count: period.count,
+              };
+
+              if (includeItems && period.items) {
+                result.items = period.items.map((item: any) => ({
+                  key: item.key,
+                  value: item.value,
+                  category: item.category,
+                  priority: item.priority,
+                  created_at: item.created_at,
+                }));
+
+                if (period.hasMore) {
+                  result.hasMore = true;
+                  result.totalCount = period.totalCount;
+                }
+              }
+
+              return result;
+            }),
+            journal_entries: journals.map((journal: any) => ({
+              entry: journal.entry,
+              tags: JSON.parse(journal.tags || '[]'),
+              mood: journal.mood,
+              created_at: journal.created_at,
+            })),
           };
 
-          for (const item of items) {
-            const priority = (item.priority || 'normal') as 'high' | 'normal' | 'low';
-            summary.priorities[priority]++;
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(timelineData, null, 2),
+              },
+            ],
+          };
+        } catch (error: any) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Timeline generation failed: ${error.message}`,
+              },
+            ],
+          };
+        }
+      }
+
+      // Phase 4.4: Progressive Compression
+      case 'context_compress': {
+        const { olderThan, preserveCategories = [], targetSize: _targetSize, sessionId } = args;
+        const targetSessionId = sessionId || ensureSession();
+
+        try {
+          // Build query for items to compress
+          let query = 'SELECT * FROM context_items WHERE session_id = ?';
+          const params: any[] = [targetSessionId];
+
+          if (olderThan) {
+            query += ' AND created_at < ?';
+            params.push(olderThan);
           }
 
-          compressed.push(summary);
-        }
+          if (preserveCategories.length > 0) {
+            query += ` AND category NOT IN (${preserveCategories.map(() => '?').join(',')})`;
+            params.push(...preserveCategories);
+          }
 
-        // Calculate compression
-        const originalSize = JSON.stringify(itemsToCompress).length;
-        const compressedData = JSON.stringify(compressed);
-        const compressedSize = compressedData.length;
-        const compressionRatio = 1 - compressedSize / originalSize;
+          const itemsToCompress = db.prepare(query).all(...params) as any[];
 
-        // Store compressed data
-        const compressedId = uuidv4();
-        const dateRange = itemsToCompress.reduce(
-          (acc, item) => {
-            const date = new Date(item.created_at);
-            if (!acc.start || date < acc.start) acc.start = date;
-            if (!acc.end || date > acc.end) acc.end = date;
-            return acc;
-          },
-          { start: null as Date | null, end: null as Date | null }
-        );
+          if (itemsToCompress.length === 0) {
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: 'No items found to compress with given criteria.',
+                },
+              ],
+            };
+          }
 
-        db.prepare(
-          `
+          // Group items by category for compression
+          const categoryGroups: Record<string, any[]> = {};
+          for (const item of itemsToCompress) {
+            const category = item.category || 'uncategorized';
+            if (!categoryGroups[category]) {
+              categoryGroups[category] = [];
+            }
+            categoryGroups[category].push(item);
+          }
+
+          // Compress each category group
+          const compressed: any[] = [];
+          for (const [category, items] of Object.entries(categoryGroups)) {
+            const summary = {
+              category,
+              count: items.length,
+              priorities: { high: 0, normal: 0, low: 0 },
+              keys: items.map((i: any) => i.key),
+              samples: items
+                .slice(0, 3)
+                .map((i: any) => ({ key: i.key, value: i.value.substring(0, 100) })),
+            };
+
+            for (const item of items) {
+              const priority = (item.priority || 'normal') as 'high' | 'normal' | 'low';
+              summary.priorities[priority]++;
+            }
+
+            compressed.push(summary);
+          }
+
+          // Calculate compression
+          const originalSize = JSON.stringify(itemsToCompress).length;
+          const compressedData = JSON.stringify(compressed);
+          const compressedSize = compressedData.length;
+          const compressionRatio = 1 - compressedSize / originalSize;
+
+          // Store compressed data
+          const compressedId = uuidv4();
+          const dateRange = itemsToCompress.reduce(
+            (acc, item) => {
+              const date = new Date(item.created_at);
+              if (!acc.start || date < acc.start) acc.start = date;
+              if (!acc.end || date > acc.end) acc.end = date;
+              return acc;
+            },
+            { start: null as Date | null, end: null as Date | null }
+          );
+
+          db.prepare(
+            `
           INSERT INTO compressed_context (id, session_id, original_count, compressed_data, compression_ratio, date_range_start, date_range_end)
           VALUES (?, ?, ?, ?, ?, ?, ?)
         `
-        ).run(
-          compressedId,
-          targetSessionId,
-          itemsToCompress.length,
-          compressedData,
-          compressionRatio,
-          dateRange.start?.toISOString(),
-          dateRange.end?.toISOString()
-        );
+          ).run(
+            compressedId,
+            targetSessionId,
+            itemsToCompress.length,
+            compressedData,
+            compressionRatio,
+            dateRange.start?.toISOString(),
+            dateRange.end?.toISOString()
+          );
 
-        // Delete original items
-        const deleteStmt = db.prepare('DELETE FROM context_items WHERE id = ?');
-        for (const item of itemsToCompress) {
-          deleteStmt.run(item.id);
-        }
+          // Delete original items
+          const deleteStmt = db.prepare('DELETE FROM context_items WHERE id = ?');
+          for (const item of itemsToCompress) {
+            deleteStmt.run(item.id);
+          }
 
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Compression completed!
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Compression completed!
 Items compressed: ${itemsToCompress.length}
 Original size: ${(originalSize / 1024).toFixed(2)} KB
 Compressed size: ${(compressedSize / 1024).toFixed(2)} KB
@@ -2742,79 +2927,79 @@ ${Object.entries(categoryGroups)
   .join('\n')}
 
 Compressed data ID: ${compressedId.substring(0, 8)}`,
-            },
-          ],
-        };
-      } catch (error: any) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Compression failed: ${error.message}`,
-            },
-          ],
-        };
+              },
+            ],
+          };
+        } catch (error: any) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Compression failed: ${error.message}`,
+              },
+            ],
+          };
+        }
       }
-    }
 
-    // Phase 4.4: Cross-Tool Integration
-    case 'context_integrate_tool': {
-      const { toolName, eventType, data } = args;
-      const sessionId = ensureSession();
+      // Phase 4.4: Cross-Tool Integration
+      case 'context_integrate_tool': {
+        const { toolName, eventType, data } = args;
+        const sessionId = ensureSession();
 
-      try {
-        const id = uuidv4();
-        db.prepare(
-          `
+        try {
+          const id = uuidv4();
+          db.prepare(
+            `
           INSERT INTO tool_events (id, session_id, tool_name, event_type, data)
           VALUES (?, ?, ?, ?, ?)
         `
-        ).run(id, sessionId, toolName, eventType, JSON.stringify(data));
+          ).run(id, sessionId, toolName, eventType, JSON.stringify(data));
 
-        // Optionally create a context item for important events
-        if (data.important || eventType === 'error' || eventType === 'milestone') {
-          db.prepare(
-            `
+          // Optionally create a context item for important events
+          if (data.important || eventType === 'error' || eventType === 'milestone') {
+            db.prepare(
+              `
             INSERT INTO context_items (id, session_id, key, value, category, priority)
             VALUES (?, ?, ?, ?, ?, ?)
           `
-          ).run(
-            uuidv4(),
-            sessionId,
-            `${toolName}_${eventType}_${Date.now()}`,
-            `Tool event: ${toolName} - ${eventType}: ${JSON.stringify(data)}`,
-            'tool_event',
-            data.important ? 'high' : 'normal'
-          );
-        }
+            ).run(
+              uuidv4(),
+              sessionId,
+              `${toolName}_${eventType}_${Date.now()}`,
+              `Tool event: ${toolName} - ${eventType}: ${JSON.stringify(data)}`,
+              'tool_event',
+              data.important ? 'high' : 'normal'
+            );
+          }
 
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Tool event recorded!
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Tool event recorded!
 Tool: ${toolName}
 Event: ${eventType}
 Data recorded: ${JSON.stringify(data).length} bytes
 Event ID: ${id.substring(0, 8)}`,
-            },
-          ],
-        };
-      } catch (error: any) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Tool integration failed: ${error.message}`,
-            },
-          ],
-        };
+              },
+            ],
+          };
+        } catch (error: any) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Tool integration failed: ${error.message}`,
+              },
+            ],
+          };
+        }
       }
-    }
 
-    // Cross-Session Collaboration Tools
-    // REMOVED: Sharing is now automatic (public by default)
-    /*
+      // Cross-Session Collaboration Tools
+      // REMOVED: Sharing is now automatic (public by default)
+      /*
     case 'context_share': {
       const { key, targetSessions, makePublic = false } = args;
       const sessionId = ensureSession();
@@ -2852,8 +3037,8 @@ Event ID: ${id.substring(0, 8)}`,
     }
     */
 
-    // REMOVED: All accessible items are retrieved via context_get
-    /*
+      // REMOVED: All accessible items are retrieved via context_get
+      /*
     case 'context_get_shared': {
       const { includeAll = false } = args;
       const sessionId = ensureSession();
@@ -2896,46 +3081,14 @@ Event ID: ${id.substring(0, 8)}`,
     }
     */
 
-    case 'context_search_all': {
-      const {
-        query,
-        sessions,
-        includeShared = true,
-        limit: rawLimit = 25,
-        offset: rawOffset = 0,
-        sort = 'created_desc',
-        category,
-        channel,
-        channels,
-        priorities,
-        createdAfter,
-        createdBefore,
-        keyPattern,
-        searchIn = ['key', 'value'],
-        includeMetadata = false,
-      } = args;
-
-      // Enhanced pagination validation with proper error handling
-      const paginationValidation = validatePaginationParams({ limit: rawLimit, offset: rawOffset });
-      const { limit, offset, errors: paginationErrors } = paginationValidation;
-      const currentSession = currentSessionId || ensureSession();
-
-      // Log pagination validation errors for debugging
-      if (paginationErrors.length > 0) {
-        debugLog('Pagination validation errors:', paginationErrors);
-      }
-
-      try {
-        // Use enhanced search across sessions with pagination
-        const result = repositories.contexts.searchAcrossSessionsEnhanced({
+      case 'context_search_all': {
+        const {
           query,
-          currentSessionId: currentSession,
           sessions,
-          includeShared,
-          searchIn,
-          limit,
-          offset,
-          sort,
+          includeShared = true,
+          limit: rawLimit = 25,
+          offset: rawOffset = 0,
+          sort = 'created_desc',
           category,
           channel,
           channels,
@@ -2943,173 +3096,542 @@ Event ID: ${id.substring(0, 8)}`,
           createdAfter,
           createdBefore,
           keyPattern,
-          includeMetadata,
-        });
+          searchIn = ['key', 'value'],
+          includeMetadata = false,
+        } = args;
 
-        // PAGINATION VALIDATION: Ensure pagination is working as expected
-        if (result.items.length > limit && limit < result.totalCount) {
-          debugLog(
-            `Pagination warning: Expected max ${limit} items, got ${result.items.length}. This may indicate a pagination implementation issue.`
-          );
+        // Enhanced pagination validation with proper error handling
+        const paginationValidation = validatePaginationParams({
+          limit: rawLimit,
+          offset: rawOffset,
+        });
+        const { limit, offset, errors: paginationErrors } = paginationValidation;
+        const currentSession = currentSessionId || ensureSession();
+
+        // Log pagination validation errors for debugging
+        if (paginationErrors.length > 0) {
+          debugLog('Pagination validation errors:', paginationErrors);
         }
 
-        if (result.items.length === 0) {
+        try {
+          // Use enhanced search across sessions with pagination
+          const result = repositories.contexts.searchAcrossSessionsEnhanced({
+            query,
+            currentSessionId: currentSession,
+            sessions,
+            includeShared,
+            searchIn,
+            limit,
+            offset,
+            sort,
+            category,
+            channel,
+            channels,
+            priorities,
+            createdAfter,
+            createdBefore,
+            keyPattern,
+            includeMetadata,
+          });
+
+          // PAGINATION VALIDATION: Ensure pagination is working as expected
+          if (result.items.length > limit && limit < result.totalCount) {
+            debugLog(
+              `Pagination warning: Expected max ${limit} items, got ${result.items.length}. This may indicate a pagination implementation issue.`
+            );
+          }
+
+          if (result.items.length === 0) {
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: `No results found for: "${query}"${result.totalCount > 0 ? ` (showing page ${result.pagination.currentPage} of ${result.pagination.totalPages})` : ''}`,
+                },
+              ],
+            };
+          }
+
+          const resultsList = result.items
+            .map(
+              (item: any) =>
+                `• [${item.session_id.substring(0, 8)}] ${item.key}: ${item.value.substring(0, 100)}${item.value.length > 100 ? '...' : ''}`
+            )
+            .join('\n');
+
+          // Build pagination info
+          const paginationInfo =
+            result.pagination.totalPages > 1
+              ? `\n\nPagination: Page ${result.pagination.currentPage} of ${result.pagination.totalPages} (${result.pagination.totalItems} total items)${
+                  result.pagination.hasNextPage
+                    ? `\nNext page: offset=${result.pagination.nextOffset}, limit=${result.pagination.itemsPerPage}`
+                    : ''
+                }${
+                  result.pagination.hasPreviousPage
+                    ? `\nPrevious page: offset=${result.pagination.previousOffset}, limit=${result.pagination.itemsPerPage}`
+                    : ''
+                }`
+              : '';
+
           return {
             content: [
               {
                 type: 'text',
-                text: `No results found for: "${query}"${result.totalCount > 0 ? ` (showing page ${result.pagination.currentPage} of ${result.pagination.totalPages})` : ''}`,
+                text: `Found ${result.items.length} results on this page (${result.totalCount} total across sessions):\n\n${resultsList}${paginationInfo}`,
+              },
+            ],
+          };
+        } catch (error: any) {
+          // Enhanced error handling to distinguish pagination errors from search errors
+          let errorMessage = 'Search failed';
+
+          if (paginationErrors.length > 0) {
+            errorMessage = `Search failed due to pagination validation errors: ${paginationErrors.join(', ')}. ${error.message}`;
+          } else if (
+            error.message.includes('pagination') ||
+            error.message.includes('limit') ||
+            error.message.includes('offset')
+          ) {
+            errorMessage = `Search failed due to pagination parameter issue: ${error.message}`;
+          } else {
+            errorMessage = `Search failed: ${error.message}`;
+          }
+
+          debugLog('Search error:', { error: error.message, paginationErrors, limit, offset });
+
+          return {
+            content: [
+              {
+                type: 'text',
+                text: errorMessage,
+              },
+            ],
+          };
+        }
+      }
+
+      // Context Diff - Track changes since a specific point in time
+      case 'context_diff': {
+        const {
+          since,
+          sessionId: specificSessionId,
+          category,
+          channel,
+          channels,
+          includeValues = true,
+          limit,
+          offset,
+        } = args;
+        const targetSessionId = specificSessionId || currentSessionId || ensureSession();
+
+        try {
+          // Parse the 'since' parameter
+          let sinceTimestamp: string | null = null;
+          let checkpointId: string | null = null;
+
+          if (since) {
+            // Check if it's a checkpoint name or ID
+            const checkpointByName = db
+              .prepare('SELECT * FROM checkpoints WHERE name = ? ORDER BY created_at DESC LIMIT 1')
+              .get(since) as any;
+
+            const checkpointById = !checkpointByName
+              ? (db.prepare('SELECT * FROM checkpoints WHERE id = ?').get(since) as any)
+              : null;
+
+            const checkpoint = checkpointByName || checkpointById;
+
+            if (checkpoint) {
+              checkpointId = checkpoint.id;
+              sinceTimestamp = checkpoint.created_at;
+            } else {
+              // Try to parse as relative time
+              const parsedTime = parseRelativeTime(since);
+              if (parsedTime) {
+                sinceTimestamp = parsedTime;
+              } else {
+                // Assume it's an ISO timestamp
+                sinceTimestamp = since;
+              }
+            }
+          } else {
+            // Default to 1 hour ago if no 'since' provided
+            sinceTimestamp = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+          }
+
+          // Convert ISO timestamp to SQLite format for repository compatibility
+          const sqliteTimestamp = ensureSQLiteFormat(sinceTimestamp!);
+
+          // Use repository method to get diff data
+          const diffData = repositories.contexts.getDiff({
+            sessionId: targetSessionId,
+            sinceTimestamp: sqliteTimestamp,
+            category,
+            channel,
+            channels,
+            limit,
+            offset,
+            includeValues,
+          });
+
+          // Handle deleted items if we have a checkpoint
+          let deletedKeys: string[] = [];
+          if (checkpointId) {
+            deletedKeys = repositories.contexts.getDeletedKeysFromCheckpoint(
+              targetSessionId,
+              checkpointId
+            );
+          }
+
+          // Format response
+          const toDate = new Date().toISOString();
+          const response: any = {
+            added: includeValues
+              ? diffData.added
+              : diffData.added.map(i => ({ key: i.key, category: i.category })),
+            modified: includeValues
+              ? diffData.modified
+              : diffData.modified.map(i => ({ key: i.key, category: i.category })),
+            deleted: deletedKeys,
+            summary: `${diffData.added.length} added, ${diffData.modified.length} modified, ${deletedKeys.length} deleted`,
+            period: {
+              from: sinceTimestamp,
+              to: toDate,
+            },
+          };
+
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(response, null, 2),
+              },
+            ],
+          };
+        } catch (error: any) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Failed to get context diff: ${error.message}`,
+              },
+            ],
+          };
+        }
+      }
+
+      // Channel Management
+      case 'context_list_channels': {
+        const { sessionId, sessionIds, sort, includeEmpty } = args;
+
+        try {
+          const channels = repositories.contexts.listChannels({
+            sessionId: sessionId || currentSessionId,
+            sessionIds,
+            sort,
+            includeEmpty,
+          });
+
+          if (channels.length === 0) {
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: 'No channels found.',
+                },
+              ],
+            };
+          }
+
+          // Format the response
+          const channelList = channels
+            .map(
+              (ch: any) =>
+                `• ${ch.channel}: ${ch.total_count} items (${ch.public_count} public, ${ch.private_count} private)\n  Last activity: ${new Date(ch.last_activity).toLocaleString()}\n  Categories: ${ch.categories.join(', ') || 'none'}\n  Sessions: ${ch.session_count}`
+            )
+            .join('\n\n');
+
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Found ${channels.length} channels:\n\n${channelList}`,
+              },
+            ],
+          };
+        } catch (error: any) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Failed to list channels: ${error.message}`,
+              },
+            ],
+          };
+        }
+      }
+
+      case 'context_channel_stats': {
+        const { channel, sessionId, includeTimeSeries, includeInsights } = args;
+
+        try {
+          const stats = repositories.contexts.getChannelStats({
+            channel,
+            sessionId: sessionId || currentSessionId,
+            includeTimeSeries,
+            includeInsights,
+          });
+
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(stats, null, 2),
+              },
+            ],
+          };
+        } catch (error: any) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Failed to get channel stats: ${error.message}`,
+              },
+            ],
+          };
+        }
+      }
+
+      // Context Watch functionality
+      case 'context_watch': {
+        return await handleContextWatch(args, repositories, ensureSession());
+      }
+
+      // Context Reassign Channel
+      case 'context_reassign_channel': {
+        const {
+          keys,
+          keyPattern,
+          fromChannel,
+          toChannel,
+          sessionId,
+          category,
+          priorities,
+          dryRun = false,
+        } = args;
+
+        try {
+          // Validate input
+          if (!toChannel || !toChannel.trim()) {
+            throw new Error('Target channel name cannot be empty');
+          }
+
+          if (!keys && !keyPattern && !fromChannel) {
+            throw new Error('Must provide either keys array, keyPattern, or fromChannel');
+          }
+
+          if (fromChannel && fromChannel === toChannel) {
+            throw new Error('Source and destination channels cannot be the same');
+          }
+
+          const targetSessionId = sessionId || ensureSession();
+
+          // Call repository method
+          const result = await repositories.contexts.reassignChannel({
+            keys,
+            keyPattern,
+            fromChannel,
+            toChannel,
+            sessionId: targetSessionId,
+            category,
+            priorities,
+            dryRun,
+          });
+
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(result, null, 2),
+              },
+            ],
+          };
+        } catch (error: any) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Failed to reassign channel: ${error.message}`,
+              },
+            ],
+          };
+        }
+      }
+
+      // Batch Operations
+      case 'context_batch_save': {
+        const { items, updateExisting = true } = args;
+        const sessionId = ensureSession();
+
+        // Validate items
+        if (!items || !Array.isArray(items) || items.length === 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'No items provided for batch save',
               },
             ],
           };
         }
 
-        const resultsList = result.items
-          .map(
-            (item: any) =>
-              `• [${item.session_id.substring(0, 8)}] ${item.key}: ${item.value.substring(0, 100)}${item.value.length > 100 ? '...' : ''}`
-          )
-          .join('\n');
-
-        // Build pagination info
-        const paginationInfo =
-          result.pagination.totalPages > 1
-            ? `\n\nPagination: Page ${result.pagination.currentPage} of ${result.pagination.totalPages} (${result.pagination.totalItems} total items)${
-                result.pagination.hasNextPage
-                  ? `\nNext page: offset=${result.pagination.nextOffset}, limit=${result.pagination.itemsPerPage}`
-                  : ''
-              }${
-                result.pagination.hasPreviousPage
-                  ? `\nPrevious page: offset=${result.pagination.previousOffset}, limit=${result.pagination.itemsPerPage}`
-                  : ''
-              }`
-            : '';
-
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Found ${result.items.length} results on this page (${result.totalCount} total across sessions):\n\n${resultsList}${paginationInfo}`,
-            },
-          ],
-        };
-      } catch (error: any) {
-        // Enhanced error handling to distinguish pagination errors from search errors
-        let errorMessage = 'Search failed';
-
-        if (paginationErrors.length > 0) {
-          errorMessage = `Search failed due to pagination validation errors: ${paginationErrors.join(', ')}. ${error.message}`;
-        } else if (
-          error.message.includes('pagination') ||
-          error.message.includes('limit') ||
-          error.message.includes('offset')
-        ) {
-          errorMessage = `Search failed due to pagination parameter issue: ${error.message}`;
-        } else {
-          errorMessage = `Search failed: ${error.message}`;
+        // Enforce batch size limit
+        const maxBatchSize = 100;
+        if (items.length > maxBatchSize) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Batch size ${items.length} exceeds maximum allowed size of ${maxBatchSize}`,
+              },
+            ],
+          };
         }
 
-        debugLog('Search error:', { error: error.message, paginationErrors, limit, offset });
-
-        return {
-          content: [
-            {
-              type: 'text',
-              text: errorMessage,
-            },
-          ],
-        };
-      }
-    }
-
-    // Context Diff - Track changes since a specific point in time
-    case 'context_diff': {
-      const {
-        since,
-        sessionId: specificSessionId,
-        category,
-        channel,
-        channels,
-        includeValues = true,
-        limit,
-        offset,
-      } = args;
-      const targetSessionId = specificSessionId || currentSessionId || ensureSession();
-
-      try {
-        // Parse the 'since' parameter
-        let sinceTimestamp: string | null = null;
-        let checkpointId: string | null = null;
-
-        if (since) {
-          // Check if it's a checkpoint name or ID
-          const checkpointByName = db
-            .prepare('SELECT * FROM checkpoints WHERE name = ? ORDER BY created_at DESC LIMIT 1')
-            .get(since) as any;
-
-          const checkpointById = !checkpointByName
-            ? (db.prepare('SELECT * FROM checkpoints WHERE id = ?').get(since) as any)
-            : null;
-
-          const checkpoint = checkpointByName || checkpointById;
-
-          if (checkpoint) {
-            checkpointId = checkpoint.id;
-            sinceTimestamp = checkpoint.created_at;
-          } else {
-            // Try to parse as relative time
-            const parsedTime = parseRelativeTime(since);
-            if (parsedTime) {
-              sinceTimestamp = parsedTime;
-            } else {
-              // Assume it's an ISO timestamp
-              sinceTimestamp = since;
+        // Validate items
+        const validationErrors: any[] = [];
+        items.forEach((item, index) => {
+          try {
+            // Validate item
+            if (!item.key || !item.key.trim()) {
+              throw new Error('Key is required and cannot be empty');
             }
+            if (!item.value) {
+              throw new Error('Value is required');
+            }
+
+            // Validate category
+            if (item.category) {
+              const validCategories = ['task', 'decision', 'progress', 'note', 'error', 'warning'];
+              if (!validCategories.includes(item.category)) {
+                throw new Error(`Invalid category: ${item.category}`);
+              }
+            }
+
+            // Validate priority
+            if (item.priority) {
+              const validPriorities = ['high', 'normal', 'low'];
+              if (!validPriorities.includes(item.priority)) {
+                throw new Error(`Invalid priority: ${item.priority}`);
+              }
+            }
+          } catch (error: any) {
+            validationErrors.push({
+              index,
+              key: item.key || 'undefined',
+              error: error.message,
+            });
           }
-        } else {
-          // Default to 1 hour ago if no 'since' provided
-          sinceTimestamp = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-        }
-
-        // Convert ISO timestamp to SQLite format for repository compatibility
-        const sqliteTimestamp = ensureSQLiteFormat(sinceTimestamp!);
-
-        // Use repository method to get diff data
-        const diffData = repositories.contexts.getDiff({
-          sessionId: targetSessionId,
-          sinceTimestamp: sqliteTimestamp,
-          category,
-          channel,
-          channels,
-          limit,
-          offset,
-          includeValues,
         });
 
-        // Handle deleted items if we have a checkpoint
-        let deletedKeys: string[] = [];
-        if (checkpointId) {
-          deletedKeys = repositories.contexts.getDeletedKeysFromCheckpoint(
-            targetSessionId,
-            checkpointId
-          );
+        // If all items have validation errors, return early
+        if (validationErrors.length === items.length) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(
+                  {
+                    operation: 'batch_save',
+                    totalItems: items.length,
+                    succeeded: 0,
+                    failed: validationErrors.length,
+                    totalSize: 0,
+                    results: [],
+                    errors: validationErrors,
+                    timestamp: new Date().toISOString(),
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
         }
 
-        // Format response
-        const toDate = new Date().toISOString();
-        const response: any = {
-          added: includeValues
-            ? diffData.added
-            : diffData.added.map(i => ({ key: i.key, category: i.category })),
-          modified: includeValues
-            ? diffData.modified
-            : diffData.modified.map(i => ({ key: i.key, category: i.category })),
-          deleted: deletedKeys,
-          summary: `${diffData.added.length} added, ${diffData.modified.length} modified, ${deletedKeys.length} deleted`,
-          period: {
-            from: sinceTimestamp,
-            to: toDate,
-          },
+        let results: any[] = [];
+        let errors: any[] = [];
+        let totalSize = 0;
+
+        // Begin transaction
+        db.prepare('BEGIN TRANSACTION').run();
+
+        try {
+          // Use repository method
+          const batchResult = repositories.contexts.batchSave(sessionId, items, { updateExisting });
+          totalSize = batchResult.totalSize;
+
+          // Merge validation errors with operation results
+          const allResults = batchResult.results.filter(r => r.success);
+          const allErrors = [
+            ...validationErrors,
+            ...batchResult.results
+              .filter(r => !r.success)
+              .map(r => ({
+                index: r.index,
+                key: r.key,
+                error: r.error,
+              })),
+          ];
+
+          // Commit transaction
+          db.prepare('COMMIT').run();
+
+          // Create embeddings for successful saves (async, don't wait)
+          allResults.forEach(async result => {
+            if (result.success && result.action === 'created') {
+              try {
+                const item = items[result.index];
+                const content = `${item.key}: ${item.value}`;
+                const metadata = {
+                  key: item.key,
+                  category: item.category,
+                  priority: item.priority,
+                };
+                await vectorStore.storeDocument(result.id!, content, metadata);
+              } catch (error) {
+                // Log but don't fail
+                console.error('Failed to create embedding:', error);
+              }
+            }
+          });
+
+          results = allResults;
+          errors = allErrors;
+        } catch (error) {
+          // Rollback transaction
+          db.prepare('ROLLBACK').run();
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Batch save failed: ${(error as Error).message}`,
+              },
+            ],
+          };
+        }
+
+        // Prepare response
+        const response = {
+          operation: 'batch_save',
+          totalItems: items.length,
+          succeeded: results.length,
+          failed: errors.length,
+          totalSize: totalSize,
+          averageSize: results.length > 0 ? Math.round(totalSize / results.length) : 0,
+          results: results,
+          errors: errors,
+          timestamp: new Date().toISOString(),
         };
 
         return {
@@ -3120,247 +3642,332 @@ Event ID: ${id.substring(0, 8)}`,
             },
           ],
         };
-      } catch (error: any) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Failed to get context diff: ${error.message}`,
-            },
-          ],
-        };
       }
-    }
 
-    // Channel Management
-    case 'context_list_channels': {
-      const { sessionId, sessionIds, sort, includeEmpty } = args;
+      case 'context_batch_delete': {
+        const { keys, keyPattern, sessionId: specificSessionId, dryRun = false } = args;
+        const targetSessionId = specificSessionId || currentSessionId || ensureSession();
 
-      try {
-        const channels = repositories.contexts.listChannels({
-          sessionId: sessionId || currentSessionId,
-          sessionIds,
-          sort,
-          includeEmpty,
-        });
-
-        if (channels.length === 0) {
+        // Validate input
+        if (!keys && !keyPattern) {
           return {
             content: [
               {
                 type: 'text',
-                text: 'No channels found.',
+                text: 'Either keys array or keyPattern must be provided',
               },
             ],
           };
         }
 
-        // Format the response
-        const channelList = channels
-          .map(
-            (ch: any) =>
-              `• ${ch.channel}: ${ch.total_count} items (${ch.public_count} public, ${ch.private_count} private)\n  Last activity: ${new Date(ch.last_activity).toLocaleString()}\n  Categories: ${ch.categories.join(', ') || 'none'}\n  Sessions: ${ch.session_count}`
-          )
-          .join('\n\n');
-
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Found ${channels.length} channels:\n\n${channelList}`,
-            },
-          ],
-        };
-      } catch (error: any) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Failed to list channels: ${error.message}`,
-            },
-          ],
-        };
-      }
-    }
-
-    case 'context_channel_stats': {
-      const { channel, sessionId, includeTimeSeries, includeInsights } = args;
-
-      try {
-        const stats = repositories.contexts.getChannelStats({
-          channel,
-          sessionId: sessionId || currentSessionId,
-          includeTimeSeries,
-          includeInsights,
-        });
-
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(stats, null, 2),
-            },
-          ],
-        };
-      } catch (error: any) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Failed to get channel stats: ${error.message}`,
-            },
-          ],
-        };
-      }
-    }
-
-    // Context Watch functionality
-    case 'context_watch': {
-      return await handleContextWatch(args, repositories, ensureSession());
-    }
-
-    // Context Reassign Channel
-    case 'context_reassign_channel': {
-      const {
-        keys,
-        keyPattern,
-        fromChannel,
-        toChannel,
-        sessionId,
-        category,
-        priorities,
-        dryRun = false,
-      } = args;
-
-      try {
-        // Validate input
-        if (!toChannel || !toChannel.trim()) {
-          throw new Error('Target channel name cannot be empty');
+        if (keys && (!Array.isArray(keys) || keys.length === 0)) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'Keys must be a non-empty array',
+              },
+            ],
+          };
         }
 
-        if (!keys && !keyPattern && !fromChannel) {
-          throw new Error('Must provide either keys array, keyPattern, or fromChannel');
-        }
+        let results: any[] = [];
+        let totalDeleted = 0;
 
-        if (fromChannel && fromChannel === toChannel) {
-          throw new Error('Source and destination channels cannot be the same');
-        }
-
-        const targetSessionId = sessionId || ensureSession();
-
-        // Call repository method
-        const result = await repositories.contexts.reassignChannel({
-          keys,
-          keyPattern,
-          fromChannel,
-          toChannel,
-          sessionId: targetSessionId,
-          category,
-          priorities,
-          dryRun,
-        });
-
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
-        };
-      } catch (error: any) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Failed to reassign channel: ${error.message}`,
-            },
-          ],
-        };
-      }
-    }
-
-    // Batch Operations
-    case 'context_batch_save': {
-      const { items, updateExisting = true } = args;
-      const sessionId = ensureSession();
-
-      // Validate items
-      if (!items || !Array.isArray(items) || items.length === 0) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: 'No items provided for batch save',
-            },
-          ],
-        };
-      }
-
-      // Enforce batch size limit
-      const maxBatchSize = 100;
-      if (items.length > maxBatchSize) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Batch size ${items.length} exceeds maximum allowed size of ${maxBatchSize}`,
-            },
-          ],
-        };
-      }
-
-      // Validate items
-      const validationErrors: any[] = [];
-      items.forEach((item, index) => {
         try {
-          // Validate item
-          if (!item.key || !item.key.trim()) {
-            throw new Error('Key is required and cannot be empty');
-          }
-          if (!item.value) {
-            throw new Error('Value is required');
+          if (dryRun) {
+            // Dry run - just show what would be deleted
+            const itemsToDelete = repositories.contexts.getDryRunItems(targetSessionId, {
+              keys,
+              keyPattern,
+            });
+
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify(
+                    {
+                      operation: 'batch_delete',
+                      dryRun: true,
+                      keys: keys,
+                      pattern: keyPattern,
+                      itemsToDelete: itemsToDelete,
+                      totalItems: itemsToDelete.length,
+                    },
+                    null,
+                    2
+                  ),
+                },
+              ],
+            };
           }
 
-          // Validate category
-          if (item.category) {
-            const validCategories = ['task', 'decision', 'progress', 'note', 'error', 'warning'];
-            if (!validCategories.includes(item.category)) {
-              throw new Error(`Invalid category: ${item.category}`);
-            }
-          }
+          // Actual deletion
+          db.prepare('BEGIN TRANSACTION').run();
 
-          // Validate priority
-          if (item.priority) {
-            const validPriorities = ['high', 'normal', 'low'];
-            if (!validPriorities.includes(item.priority)) {
-              throw new Error(`Invalid priority: ${item.priority}`);
-            }
-          }
-        } catch (error: any) {
-          validationErrors.push({
-            index,
-            key: item.key || 'undefined',
-            error: error.message,
+          const deleteResult = repositories.contexts.batchDelete(targetSessionId, {
+            keys,
+            keyPattern,
           });
-        }
-      });
+          results = deleteResult.results || [];
+          totalDeleted = deleteResult.totalDeleted;
 
-      // If all items have validation errors, return early
-      if (validationErrors.length === items.length) {
+          db.prepare('COMMIT').run();
+        } catch (error) {
+          db.prepare('ROLLBACK').run();
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Batch delete failed: ${(error as Error).message}`,
+              },
+            ],
+          };
+        }
+
+        // Prepare response
+        const response = keys
+          ? {
+              operation: 'batch_delete',
+              keys: keys,
+              totalRequested: keys.length,
+              totalDeleted: totalDeleted,
+              notFound: results.filter(r => !r.deleted).map(r => r.key),
+              results: results,
+            }
+          : {
+              operation: 'batch_delete',
+              pattern: keyPattern,
+              totalDeleted: totalDeleted,
+            };
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(response, null, 2),
+            },
+          ],
+        };
+      }
+
+      case 'context_batch_update': {
+        const { updates, sessionId: specificSessionId } = args;
+        const targetSessionId = specificSessionId || currentSessionId || ensureSession();
+
+        // Validate input
+        if (!updates || !Array.isArray(updates) || updates.length === 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'Updates array must be provided and non-empty',
+              },
+            ],
+          };
+        }
+
+        // Validate updates
+        const validationErrors: any[] = [];
+        updates.forEach((update, index) => {
+          try {
+            // Validate update
+            if (!update.key || !update.key.trim()) {
+              throw new Error('Key is required and cannot be empty');
+            }
+
+            // Check if any updates are provided
+            const hasUpdates =
+              update.value !== undefined ||
+              update.category !== undefined ||
+              update.priority !== undefined ||
+              update.channel !== undefined;
+
+            if (!hasUpdates) {
+              throw new Error('No updates provided');
+            }
+
+            // Validate fields if provided
+            if (update.category !== undefined) {
+              const validCategories = ['task', 'decision', 'progress', 'note', 'error', 'warning'];
+              if (!validCategories.includes(update.category)) {
+                throw new Error(`Invalid category: ${update.category}`);
+              }
+            }
+
+            if (update.priority !== undefined) {
+              const validPriorities = ['high', 'normal', 'low'];
+              if (!validPriorities.includes(update.priority)) {
+                throw new Error(`Invalid priority: ${update.priority}`);
+              }
+            }
+
+            if (update.value !== undefined && update.value === '') {
+              throw new Error('Value cannot be empty');
+            }
+          } catch (error: any) {
+            validationErrors.push({
+              index,
+              key: update.key || 'undefined',
+              error: error.message,
+            });
+          }
+        });
+
+        // If all updates have validation errors, return early
+        if (validationErrors.length === updates.length) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(
+                  {
+                    operation: 'batch_update',
+                    totalItems: updates.length,
+                    succeeded: 0,
+                    failed: validationErrors.length,
+                    results: [],
+                    errors: validationErrors,
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+
+        let results: any[] = [];
+        let errors: any[] = [];
+
+        // Begin transaction
+        db.prepare('BEGIN TRANSACTION').run();
+
+        try {
+          // Use repository method
+          const updateResult = repositories.contexts.batchUpdate(targetSessionId, updates);
+
+          // Merge validation errors with operation results
+          results = updateResult.results.filter(r => r.updated);
+          errors = [
+            ...validationErrors,
+            ...updateResult.results
+              .filter(r => !r.updated)
+              .map(r => ({
+                index: r.index,
+                key: r.key,
+                error: r.error,
+              })),
+          ];
+
+          // Commit transaction
+          db.prepare('COMMIT').run();
+        } catch (error) {
+          // Rollback transaction
+          db.prepare('ROLLBACK').run();
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Batch update failed: ${(error as Error).message}`,
+              },
+            ],
+          };
+        }
+
+        // Prepare response
+        const response = {
+          operation: 'batch_update',
+          totalItems: updates.length,
+          succeeded: results.length,
+          failed: errors.length,
+          results: results,
+          errors: errors,
+        };
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(response, null, 2),
+            },
+          ],
+        };
+      }
+
+      // Context Relationships
+      case 'context_link': {
+        const { sourceKey, targetKey, relationship, metadata } = args;
+        const sessionId = currentSessionId || ensureSession();
+
+        // Validate inputs
+        if (!sourceKey || !sourceKey.trim()) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'Error: sourceKey cannot be empty',
+              },
+            ],
+          };
+        }
+
+        if (!targetKey || !targetKey.trim()) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'Error: targetKey cannot be empty',
+              },
+            ],
+          };
+        }
+
+        if (!relationship || !relationship.trim()) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'Error: relationship cannot be empty',
+              },
+            ],
+          };
+        }
+
+        // Create relationship
+        const result = repositories.contexts.createRelationship({
+          sessionId,
+          sourceKey,
+          targetKey,
+          relationship,
+          metadata,
+        });
+
+        if (!result.created) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Error: ${result.error}`,
+              },
+            ],
+          };
+        }
+
         return {
           content: [
             {
               type: 'text',
               text: JSON.stringify(
                 {
-                  operation: 'batch_save',
-                  totalItems: items.length,
-                  succeeded: 0,
-                  failed: validationErrors.length,
-                  totalSize: 0,
-                  results: [],
-                  errors: validationErrors,
+                  operation: 'context_link',
+                  relationshipId: result.id,
+                  sourceKey,
+                  targetKey,
+                  relationship,
+                  metadata,
+                  created: true,
                   timestamp: new Date().toISOString(),
                 },
                 null,
@@ -3371,489 +3978,106 @@ Event ID: ${id.substring(0, 8)}`,
         };
       }
 
-      let results: any[] = [];
-      let errors: any[] = [];
-      let totalSize = 0;
+      case 'context_get_related': {
+        const { key, relationship, depth = 1, direction = 'both' } = args;
+        const sessionId = currentSessionId || ensureSession();
 
-      // Begin transaction
-      db.prepare('BEGIN TRANSACTION').run();
-
-      try {
-        // Use repository method
-        const batchResult = repositories.contexts.batchSave(sessionId, items, { updateExisting });
-        totalSize = batchResult.totalSize;
-
-        // Merge validation errors with operation results
-        const allResults = batchResult.results.filter(r => r.success);
-        const allErrors = [
-          ...validationErrors,
-          ...batchResult.results
-            .filter(r => !r.success)
-            .map(r => ({
-              index: r.index,
-              key: r.key,
-              error: r.error,
-            })),
-        ];
-
-        // Commit transaction
-        db.prepare('COMMIT').run();
-
-        // Create embeddings for successful saves (async, don't wait)
-        allResults.forEach(async result => {
-          if (result.success && result.action === 'created') {
-            try {
-              const item = items[result.index];
-              const content = `${item.key}: ${item.value}`;
-              const metadata = { key: item.key, category: item.category, priority: item.priority };
-              await vectorStore.storeDocument(result.id!, content, metadata);
-            } catch (error) {
-              // Log but don't fail
-              console.error('Failed to create embedding:', error);
-            }
-          }
-        });
-
-        results = allResults;
-        errors = allErrors;
-      } catch (error) {
-        // Rollback transaction
-        db.prepare('ROLLBACK').run();
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Batch save failed: ${(error as Error).message}`,
-            },
-          ],
-        };
-      }
-
-      // Prepare response
-      const response = {
-        operation: 'batch_save',
-        totalItems: items.length,
-        succeeded: results.length,
-        failed: errors.length,
-        totalSize: totalSize,
-        averageSize: results.length > 0 ? Math.round(totalSize / results.length) : 0,
-        results: results,
-        errors: errors,
-        timestamp: new Date().toISOString(),
-      };
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(response, null, 2),
-          },
-        ],
-      };
-    }
-
-    case 'context_batch_delete': {
-      const { keys, keyPattern, sessionId: specificSessionId, dryRun = false } = args;
-      const targetSessionId = specificSessionId || currentSessionId || ensureSession();
-
-      // Validate input
-      if (!keys && !keyPattern) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: 'Either keys array or keyPattern must be provided',
-            },
-          ],
-        };
-      }
-
-      if (keys && (!Array.isArray(keys) || keys.length === 0)) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: 'Keys must be a non-empty array',
-            },
-          ],
-        };
-      }
-
-      let results: any[] = [];
-      let totalDeleted = 0;
-
-      try {
-        if (dryRun) {
-          // Dry run - just show what would be deleted
-          const itemsToDelete = repositories.contexts.getDryRunItems(targetSessionId, {
-            keys,
-            keyPattern,
-          });
-
+        if (!key || !key.trim()) {
           return {
             content: [
               {
                 type: 'text',
-                text: JSON.stringify(
-                  {
-                    operation: 'batch_delete',
-                    dryRun: true,
-                    keys: keys,
-                    pattern: keyPattern,
-                    itemsToDelete: itemsToDelete,
-                    totalItems: itemsToDelete.length,
-                  },
-                  null,
-                  2
-                ),
+                text: 'Error: key cannot be empty',
               },
             ],
           };
         }
 
-        // Actual deletion
-        db.prepare('BEGIN TRANSACTION').run();
-
-        const deleteResult = repositories.contexts.batchDelete(targetSessionId, {
-          keys,
-          keyPattern,
+        // Get related items
+        const result = repositories.contexts.getRelatedItems({
+          sessionId,
+          key,
+          relationship,
+          depth,
+          direction,
         });
-        results = deleteResult.results || [];
-        totalDeleted = deleteResult.totalDeleted;
 
-        db.prepare('COMMIT').run();
-      } catch (error) {
-        db.prepare('ROLLBACK').run();
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Batch delete failed: ${(error as Error).message}`,
-            },
-          ],
+        const totalRelated = result.outgoing.length + result.incoming.length;
+
+        // Prepare response
+        let response: any = {
+          operation: 'context_get_related',
+          key,
+          related: {
+            outgoing: result.outgoing,
+            incoming: result.incoming,
+          },
+          totalRelated,
         };
-      }
 
-      // Prepare response
-      const response = keys
-        ? {
-            operation: 'batch_delete',
-            keys: keys,
-            totalRequested: keys.length,
-            totalDeleted: totalDeleted,
-            notFound: results.filter(r => !r.deleted).map(r => r.key),
-            results: results,
-          }
-        : {
-            operation: 'batch_delete',
-            pattern: keyPattern,
-            totalDeleted: totalDeleted,
+        // Add graph data if depth > 1
+        if (depth > 1 && result.graph) {
+          response.visualization = {
+            format: 'graph',
+            nodes: result.graph.nodes,
+            edges: result.graph.edges,
           };
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(response, null, 2),
-          },
-        ],
-      };
-    }
-
-    case 'context_batch_update': {
-      const { updates, sessionId: specificSessionId } = args;
-      const targetSessionId = specificSessionId || currentSessionId || ensureSession();
-
-      // Validate input
-      if (!updates || !Array.isArray(updates) || updates.length === 0) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: 'Updates array must be provided and non-empty',
-            },
-          ],
-        };
-      }
-
-      // Validate updates
-      const validationErrors: any[] = [];
-      updates.forEach((update, index) => {
-        try {
-          // Validate update
-          if (!update.key || !update.key.trim()) {
-            throw new Error('Key is required and cannot be empty');
-          }
-
-          // Check if any updates are provided
-          const hasUpdates =
-            update.value !== undefined ||
-            update.category !== undefined ||
-            update.priority !== undefined ||
-            update.channel !== undefined;
-
-          if (!hasUpdates) {
-            throw new Error('No updates provided');
-          }
-
-          // Validate fields if provided
-          if (update.category !== undefined) {
-            const validCategories = ['task', 'decision', 'progress', 'note', 'error', 'warning'];
-            if (!validCategories.includes(update.category)) {
-              throw new Error(`Invalid category: ${update.category}`);
-            }
-          }
-
-          if (update.priority !== undefined) {
-            const validPriorities = ['high', 'normal', 'low'];
-            if (!validPriorities.includes(update.priority)) {
-              throw new Error(`Invalid priority: ${update.priority}`);
-            }
-          }
-
-          if (update.value !== undefined && update.value === '') {
-            throw new Error('Value cannot be empty');
-          }
-        } catch (error: any) {
-          validationErrors.push({
-            index,
-            key: update.key || 'undefined',
-            error: error.message,
-          });
+          response.summary = {
+            totalNodes: result.graph.nodes.length,
+            totalEdges: result.graph.edges.length,
+            relationshipTypes: [...new Set(result.graph.edges.map((e: any) => e.type))],
+          };
         }
-      });
 
-      // If all updates have validation errors, return early
-      if (validationErrors.length === updates.length) {
+        // Add message if no relationships found
+        if (totalRelated === 0) {
+          response.message = 'No relationships found for this item';
+        }
+
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify(
-                {
-                  operation: 'batch_update',
-                  totalItems: updates.length,
-                  succeeded: 0,
-                  failed: validationErrors.length,
-                  results: [],
-                  errors: validationErrors,
-                },
-                null,
-                2
-              ),
+              text: JSON.stringify(response, null, 2),
             },
           ],
         };
       }
 
-      let results: any[] = [];
-      let errors: any[] = [];
+      default:
+        throw new Error(`Unknown tool: ${toolName}`);
+    }
+  };
 
-      // Begin transaction
-      db.prepare('BEGIN TRANSACTION').run();
+  const isMutating = MUTATING_TOOLS.has(toolName);
+  let captureId: string | null = null;
 
-      try {
-        // Use repository method
-        const updateResult = repositories.contexts.batchUpdate(targetSessionId, updates);
+  if (isMutating) {
+    captureId = beginRecoveryCapture(toolName, args || {});
+  }
 
-        // Merge validation errors with operation results
-        results = updateResult.results.filter(r => r.updated);
-        errors = [
-          ...validationErrors,
-          ...updateResult.results
-            .filter(r => !r.updated)
-            .map(r => ({
-              index: r.index,
-              key: r.key,
-              error: r.error,
-            })),
-        ];
-
-        // Commit transaction
-        db.prepare('COMMIT').run();
-      } catch (error) {
-        // Rollback transaction
-        db.prepare('ROLLBACK').run();
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Batch update failed: ${(error as Error).message}`,
-            },
-          ],
-        };
-      }
-
-      // Prepare response
-      const response = {
-        operation: 'batch_update',
-        totalItems: updates.length,
-        succeeded: results.length,
-        failed: errors.length,
-        results: results,
-        errors: errors,
-      };
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(response, null, 2),
-          },
-        ],
-      };
+  try {
+    const result: any = await executeTool();
+    if (captureId) {
+      markRecoveryCaptureFlushed(captureId);
     }
 
-    // Context Relationships
-    case 'context_link': {
-      const { sourceKey, targetKey, relationship, metadata } = args;
-      const sessionId = currentSessionId || ensureSession();
-
-      // Validate inputs
-      if (!sourceKey || !sourceKey.trim()) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: 'Error: sourceKey cannot be empty',
-            },
-          ],
-        };
+    if (toolName !== 'context_recovery_status' && toolName !== 'context_recovery_resolve') {
+      const pending = listPendingRecoveryRecords();
+      if (pending.length > 0 && Array.isArray(result?.content) && result.content.length > 0) {
+        const first = result.content[0];
+        if (first?.type === 'text' && typeof first.text === 'string') {
+          first.text += `\n\nRecovery notice: ${pending.length} pending auto-capture item(s) detected from interrupted operations. Run context_recovery_status, then context_recovery_resolve with confirm=true and action=\"commit\" or \"discard\".`;
+        }
       }
-
-      if (!targetKey || !targetKey.trim()) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: 'Error: targetKey cannot be empty',
-            },
-          ],
-        };
-      }
-
-      if (!relationship || !relationship.trim()) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: 'Error: relationship cannot be empty',
-            },
-          ],
-        };
-      }
-
-      // Create relationship
-      const result = repositories.contexts.createRelationship({
-        sessionId,
-        sourceKey,
-        targetKey,
-        relationship,
-        metadata,
-      });
-
-      if (!result.created) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Error: ${result.error}`,
-            },
-          ],
-        };
-      }
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(
-              {
-                operation: 'context_link',
-                relationshipId: result.id,
-                sourceKey,
-                targetKey,
-                relationship,
-                metadata,
-                created: true,
-                timestamp: new Date().toISOString(),
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
     }
 
-    case 'context_get_related': {
-      const { key, relationship, depth = 1, direction = 'both' } = args;
-      const sessionId = currentSessionId || ensureSession();
-
-      if (!key || !key.trim()) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: 'Error: key cannot be empty',
-            },
-          ],
-        };
-      }
-
-      // Get related items
-      const result = repositories.contexts.getRelatedItems({
-        sessionId,
-        key,
-        relationship,
-        depth,
-        direction,
-      });
-
-      const totalRelated = result.outgoing.length + result.incoming.length;
-
-      // Prepare response
-      let response: any = {
-        operation: 'context_get_related',
-        key,
-        related: {
-          outgoing: result.outgoing,
-          incoming: result.incoming,
-        },
-        totalRelated,
-      };
-
-      // Add graph data if depth > 1
-      if (depth > 1 && result.graph) {
-        response.visualization = {
-          format: 'graph',
-          nodes: result.graph.nodes,
-          edges: result.graph.edges,
-        };
-        response.summary = {
-          totalNodes: result.graph.nodes.length,
-          totalEdges: result.graph.edges.length,
-          relationshipTypes: [...new Set(result.graph.edges.map((e: any) => e.type))],
-        };
-      }
-
-      // Add message if no relationships found
-      if (totalRelated === 0) {
-        response.message = 'No relationships found for this item';
-      }
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(response, null, 2),
-          },
-        ],
-      };
+    return result;
+  } catch (error) {
+    if (captureId) {
+      markRecoveryCapturePendingError(captureId, error);
     }
-
-    default:
-      throw new Error(`Unknown tool: ${toolName}`);
+    throw error;
   }
 });
 
@@ -4031,6 +4255,35 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       inputSchema: {
         type: 'object',
         properties: {},
+      },
+    },
+    {
+      name: 'context_recovery_status',
+      description: 'List pending auto-capture items from interrupted operations',
+      inputSchema: {
+        type: 'object',
+        properties: {},
+      },
+    },
+    {
+      name: 'context_recovery_resolve',
+      description: 'Commit or discard a pending auto-capture item',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          pendingId: { type: 'string', description: 'Pending recovery item ID' },
+          action: {
+            type: 'string',
+            enum: ['commit', 'discard'],
+            description: 'Resolution action',
+          },
+          confirm: {
+            type: 'boolean',
+            description: 'Set true to confirm resolution',
+            default: false,
+          },
+        },
+        required: ['pendingId', 'action'],
       },
     },
     // Phase 2: Checkpoint System
