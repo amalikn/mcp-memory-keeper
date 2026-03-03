@@ -35,10 +35,10 @@ Change Once Checklist:
   - `ps aux | rg "mcp-memory-keeper|dist/index.js" | rg -v rg`
   - `lsof -p <PID> | rg "context\.db|mcp-memory-keeper"`
 
-My Local Example:
+Path placeholders and example values:
 
-- `<MCP_BASE>` = `/Volumes/Data/_ai/_mcp`
-- `<MCP_DATA_BASE>` = `/Volumes/Data/_ai/mcp-data`
+- `<MCP_BASE>` = <path-to-mcp-repos> (example: `/Volumes/Data/_ai/_mcp/mcp_stuff`)
+- `<MCP_DATA_BASE>` = <path-to-mcp-data-root> (example: `/Volumes/Data/_ai/mcp-data`)
 
 Get started in under 30 seconds:
 
@@ -455,7 +455,7 @@ Optional verification (compare row counts):
 python3 - <<'PY'
 import sqlite3
 paths={
-  'claude_old':'/Users/$USER/mcp-data/memory-keeper/context.db',
+  'claude_old':'<HOME_DIR>/mcp-data/memory-keeper/context.db',
   'codex_old':'<MCP_BASE>/mcp-memory-keeper/context.db',
   'shared_new':'<MCP_DATA_BASE>/mcp-memory-keeper/context.db',
 }
