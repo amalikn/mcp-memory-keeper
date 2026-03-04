@@ -163,6 +163,20 @@ Claude Code users often face context loss when the conversation window fills up.
 - 🔗 **Context relationships** - Link related items with typed relationships
 - 👁️ **Real-time monitoring** - Watch for context changes with filters
 
+### Session-Close Capability (`exit` Workflow)
+
+For Codex and Claude Code sessions, Memory Keeper supports a consistent close-session persistence workflow:
+
+- On `exit`, persist a final context snapshot before ending the session.
+- Save progress, key decisions, blockers, and next steps as searchable context items.
+- Keep these records in shared persistent storage so resumed sessions can restore continuity quickly.
+
+Recommended tools for this workflow:
+
+- `context_save` / `context_batch_save` for final progress + decisions
+- `context_checkpoint` for a named restore point before session close
+- `context_summarize` for compact handoff notes
+
 ### Crash Recovery + Compaction Prep Behavior
 
 - Before any mutating tool runs, Memory Keeper writes an auto-capture record under `.memory-keeper-recovery/pending`.
